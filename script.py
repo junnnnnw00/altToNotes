@@ -23,14 +23,17 @@ load_dotenv()
 MODEL_ID = "gemini-2.5-flash"
 
 _client = None
+_client_lock = threading.Lock()
 
 def get_client():
     global _client
     if _client is None:
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            raise ValueError("API 키를 찾을 수 없습니다. .env 파일에 GEMINI_API_KEY를 설정해 주세요.")
-        _client = genai.Client(api_key=api_key)
+        with _client_lock:
+            if _client is None:
+                api_key = os.getenv("GEMINI_API_KEY")
+                if not api_key:
+                    raise ValueError("API 키를 찾을 수 없습니다. .env 파일에 GEMINI_API_KEY를 설정해 주세요.")
+                _client = genai.Client(api_key=api_key)
     return _client
 
 ALT_DB = Path.home() / "Library/Application Support/alt/data/database/lecture_notes.db"
@@ -89,7 +92,12 @@ def read_alt_notes() -> list[dict]:
     if not ALT_DB.exists():
         raise FileNotFoundError(f"Alt DB를 찾을 수 없습니다: {ALT_DB}\nAlt(altalt.io)가 설치되어 있는지 확인하세요.")
 
-    with sqlite3.connect(f"file:{ALT_DB}?mode=ro", uri=True) as conn:
+    try:
+        conn = sqlite3.connect(f"file:{ALT_DB}?mode=ro", uri=True)
+    except sqlite3.OperationalError as e:
+        raise RuntimeError(f"Alt DB 연결 실패: {e}") from e
+
+    with conn:
         conn.row_factory = sqlite3.Row
 
         folders = {}
@@ -136,18 +144,23 @@ def read_alt_notes() -> list[dict]:
 
 # ── Transcript parsing & alignment ────────────────────────────────────────────
 
-def parse_transcript_segments(content_text: str) -> list[dict]:
+def parse_transcript_segments(content_text) -> list[dict]:
+    if not isinstance(content_text, str):
+        return []
     try:
         chunks = json.loads(content_text)
-        segments = []
-        for chunk in chunks:
-            for seg in chunk.get("segments", []):
+    except (json.JSONDecodeError, TypeError):
+        return []
+    segments = []
+    for chunk in chunks:
+        for seg in chunk.get("segments", []):
+            try:
                 text = seg.get("text", "").strip()
                 if text:
                     segments.append({"start": seg["start"], "end": seg["end"], "text": text})
-        return segments
-    except (json.JSONDecodeError, KeyError, TypeError):
-        return []
+            except (KeyError, TypeError):
+                continue
+    return segments
 
 
 def align_transcript_to_slides(segments: list[dict], num_pages: int) -> list[str]:
@@ -163,7 +176,11 @@ def align_transcript_to_slides(segments: list[dict], num_pages: int) -> list[str
     for page in range(1, num_pages + 1):
         start_ms = (page - 1) * time_per_slide
         end_ms = page * time_per_slide
-        page_segs = [s["text"] for s in segments if start_ms <= s["start"] < end_ms]
+        is_last = page == num_pages
+        page_segs = [
+            s["text"] for s in segments
+            if start_ms <= s["start"] and (is_last or s["start"] < end_ms)
+        ]
         slide_texts.append(" ".join(page_segs))
     return slide_texts
 
@@ -264,10 +281,11 @@ def _process_slide(
             print(f"  [경고] 슬라이드 {page_num}: 빈 응답 (finish_reason={finish_reason})")
             content = "*빈 슬라이드이거나 응답을 생성할 수 없었습니다.*"
 
-        time.sleep(delay)
     except Exception as e:
         print(f"  [오류] 슬라이드 {page_num}: {e}")
         content = "*오류 발생으로 해설을 생성하지 못했습니다.*"
+    finally:
+        time.sleep(delay)
 
     return f"## Slide {page_num}\n\n{content}\n\n---\n\n"
 
