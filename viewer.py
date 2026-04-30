@@ -1,0 +1,1969 @@
+"""
+altToNotes 뷰어 — PDF와 노트를 나란히 보여주는 로컬 웹 서버
+사용법: python viewer.py [루트_디렉토리]  (기본값: 현재 디렉토리)
+"""
+import json
+import mimetypes
+import re
+import sys
+import threading
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
+
+
+def _natural_key(path: Path):
+    """Sort key for natural (human) ordering: '10_foo' comes after '2_bar'."""
+    return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', str(path))]
+
+ROOT = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path.cwd()
+SCRIPT_DIR = Path(__file__).parent.resolve()  # repo root — for serving static PWA assets
+PORT = 7788
+
+HTML = r"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>altToNotes</title>
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-512.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="altToNotes">
+<meta name="theme-color" content="#252526">
+
+<!-- markdown renderer -->
+<script src="https://cdn.jsdelivr.net/npm/markdown-it/dist/markdown-it.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/markdown-it-task-lists/dist/markdown-it-task-lists.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/markdown-it-footnote/dist/markdown-it-footnote.min.js"></script>
+
+<!-- sanitizer -->
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
+
+<!-- KaTeX -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/markdown-it-texmath/css/texmath.min.css">
+<script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/markdown-it-texmath/texmath.min.js"></script>
+
+<!-- highlight.js -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #1e1e1e;
+    --panel: #252526;
+    --panel-2: #202124;
+    --panel-3: #2d2d30;
+    --panel-4: #31343a;
+    --border: #3c3c3c;
+    --text: #d4d4d4;
+    --muted: #9da1a6;
+    --muted-2: #6f7680;
+    --accent: #569cd6;
+    --accent-2: #4ec9b0;
+    --accent-soft: rgba(86, 156, 214, 0.16);
+    --link: #79c0ff;
+    --code-inline-bg: #2b2d31;
+    --quote: #8b949e;
+    --shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+    --radius: 12px;
+    --radius-sm: 8px;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    overflow: hidden;
+  }
+
+  .layout { display: flex; flex: 1; overflow: hidden; position: relative; }
+
+  #sidebar {
+    width: 240px;
+    flex-shrink: 0;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    transition: width 0.2s ease;
+  }
+  #sidebar.collapsed { width: 0; overflow: hidden; border-right: none; }
+  #sidebar h2 {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    padding: 11px 14px;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #858585;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    white-space: nowrap;
+  }
+  .sidebar-actions { display: flex; gap: 2px; }
+  #filter-btn,
+  #toggle-btn,
+  #sidebar-open-btn {
+    background: none;
+    border: 1px solid transparent;
+    color: #858585;
+    cursor: pointer;
+    font-size: 14px;
+    line-height: 1;
+    border-radius: 6px;
+    transition: color 0.16s ease, background 0.16s ease, border-color 0.16s ease;
+  }
+  #filter-btn,
+  #toggle-btn { padding: 3px 5px; }
+  #filter-btn.active { color: var(--accent); }
+  #sidebar-open-btn {
+    display: none;
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    z-index: 10;
+    padding: 6px 8px;
+    background: rgba(37, 37, 38, 0.96);
+    border-color: var(--border);
+    box-shadow: var(--shadow);
+  }
+  #filter-btn:hover,
+  #toggle-btn:hover,
+  #sidebar-open-btn:hover {
+    color: #d4d4d4;
+    border-color: var(--border);
+    background: rgba(255, 255, 255, 0.04);
+  }
+  #sidebar-open-btn.visible { display: block; }
+
+  .course-label {
+    padding: 10px 14px 6px;
+    font-size: 11px;
+    color: var(--accent);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    white-space: nowrap;
+  }
+  .file-item {
+    padding: 8px 14px 8px 22px;
+    cursor: pointer;
+    font-size: 13px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    border-left: 2px solid transparent;
+    transition: background 0.16s ease, color 0.16s ease, border-color 0.16s ease;
+  }
+  .file-item:hover { background: #2a2d2e; }
+  .file-item.active {
+    background: var(--accent-soft);
+    border-left-color: var(--accent);
+    color: #fff;
+  }
+  .file-item.no-notes { color: #666; }
+  .file-item.no-notes::after {
+    content: ' (노트 없음)';
+    font-size: 10px;
+    color: #555;
+  }
+
+  .panes { display: flex; flex: 1; overflow: hidden; min-width: 0; position: relative; }
+  iframe {
+    flex: 1;
+    border: none;
+    background: #fff;
+    min-width: 0;
+  }
+  .divider {
+    width: 5px;
+    background: var(--border);
+    cursor: col-resize;
+    flex-shrink: 0;
+    transition: background 0.16s ease;
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .divider::after {
+    content: '';
+    position: absolute;
+    width: 3px;
+    height: 22px;
+    background: repeating-linear-gradient(
+      180deg,
+      rgba(255,255,255,0.22) 0, rgba(255,255,255,0.22) 2px,
+      transparent 2px, transparent 5px
+    );
+    border-radius: 2px;
+    pointer-events: none;
+    transition: background 0.16s ease;
+  }
+  .divider:hover, .divider.dragging { background: #007acc; }
+  .divider:hover::after, .divider.dragging::after {
+    background: repeating-linear-gradient(
+      180deg,
+      rgba(255,255,255,0.75) 0, rgba(255,255,255,0.75) 2px,
+      transparent 2px, transparent 5px
+    );
+  }
+
+  /* PDF-only restore strip — appears on right edge of panes when notes are hidden */
+  #pdf-restore-strip {
+    position: absolute;
+    top: 50%;
+    right: 0;
+    transform: translateY(-50%);
+    width: 14px;
+    height: 56px;
+    z-index: 50;
+    cursor: pointer;
+    background: var(--panel-3);
+    border: 1px solid var(--border);
+    border-right: none;
+    border-radius: 8px 0 0 8px;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.15s;
+  }
+  #pdf-restore-strip::after {
+    content: '›';
+    color: var(--muted);
+    font-size: 13px;
+    line-height: 1;
+    pointer-events: none;
+  }
+  #pdf-restore-strip:hover { background: #007acc; }
+  #pdf-restore-strip.visible { display: flex; }
+
+  /* View mode button active state */
+  .view-btn.active { background: var(--accent) !important; color: #fff !important; }
+
+  #notes-pane {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    position: relative;
+  }
+
+  #notes-toolbar {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 7px 14px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+    color: var(--muted-2);
+    z-index: 10;
+    white-space: nowrap;
+    overflow: hidden;
+  }
+  #notes-toolbar-filename {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+  }
+  .toolbar-actions { display: flex; gap: 5px; align-items: center; flex-shrink: 0; }
+
+  #notes-scroll {
+    flex: 1;
+    overflow-y: auto;
+    min-width: 0;
+    background: linear-gradient(180deg, #1f2125 0%, #1b1d21 100%);
+  }
+
+  .notes-shell {
+    max-width: 980px;
+    margin: 0 auto;
+    padding: 28px 28px 48px;
+  }
+
+  .markdown-body {
+    line-height: 1.78;
+    font-size: 15px;
+    word-break: keep-all;
+    overflow-wrap: anywhere;
+  }
+
+  .markdown-body > *:first-child { margin-top: 0 !important; }
+  .markdown-body > *:last-child { margin-bottom: 0 !important; }
+
+  .markdown-body h1,
+  .markdown-body h2,
+  .markdown-body h3,
+  .markdown-body h4,
+  .markdown-body h5,
+  .markdown-body h6 {
+    line-height: 1.3;
+    margin: 1.35em 0 0.55em;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+  }
+  .markdown-body h1 {
+    font-size: 1.75em;
+    color: var(--accent-2);
+    padding-bottom: 0.35em;
+    border-bottom: 1px solid var(--border);
+  }
+  .markdown-body h2 {
+    font-size: 1.35em;
+    color: var(--accent);
+    padding-bottom: 0.2em;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  }
+  .markdown-body h3 { font-size: 1.12em; color: #9cdcfe; }
+  .markdown-body h4,
+  .markdown-body h5,
+  .markdown-body h6 { color: #c5d7ea; }
+
+  .markdown-body p,
+  .markdown-body ul,
+  .markdown-body ol,
+  .markdown-body blockquote,
+  .markdown-body table,
+  .markdown-body pre,
+  .markdown-body details {
+    margin: 0.85em 0;
+  }
+
+  .markdown-body hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 1.5em 0;
+  }
+
+  .markdown-body a {
+    color: var(--link);
+    text-decoration: none;
+    border-bottom: 1px solid transparent;
+  }
+  .markdown-body a:hover {
+    border-bottom-color: rgba(121, 192, 255, 0.6);
+  }
+
+  .markdown-body strong { color: #f0f6fc; font-weight: 700; }
+  .markdown-body em { color: #dcdcdc; }
+  .markdown-body del { color: var(--muted); }
+
+  .markdown-body ul,
+  .markdown-body ol {
+    padding-left: 1.5em;
+  }
+  .markdown-body li {
+    margin: 0.25em 0;
+  }
+  .markdown-body li > ul,
+  .markdown-body li > ol {
+    margin: 0.35em 0;
+  }
+
+  .markdown-body .task-list-item {
+    list-style: none;
+    margin-left: -1.4em;
+    padding-left: 1.6em;
+  }
+  .markdown-body .task-list-item input[type="checkbox"] {
+    margin-right: 0.55em;
+    transform: translateY(1px);
+    accent-color: var(--accent);
+  }
+
+  .markdown-body blockquote {
+    border-left: 4px solid var(--accent);
+    padding: 0.85em 1em;
+    color: var(--quote);
+    background: rgba(86, 156, 214, 0.08);
+    border-radius: 0 10px 10px 0;
+  }
+  .markdown-body blockquote > :first-child { margin-top: 0; }
+  .markdown-body blockquote > :last-child { margin-bottom: 0; }
+
+  .markdown-body :not(pre) > code {
+    display: inline-block;
+    padding: 0.12em 0.46em;
+    margin: 0 0.1em;
+    border-radius: 6px;
+    background: var(--code-inline-bg);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    color: #ffb86c;
+    font-family: 'SFMono-Regular', Menlo, Consolas, monospace;
+    font-size: 0.9em;
+    line-height: 1.5;
+  }
+
+  .code-block {
+    margin: 1em 0;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+    overflow: hidden;
+    background: #111317;
+    box-shadow: var(--shadow);
+  }
+  .code-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 9px 12px;
+    background: #161b22;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .code-lang {
+    font-family: 'SFMono-Regular', Menlo, Consolas, monospace;
+    text-transform: lowercase;
+    letter-spacing: 0.04em;
+  }
+  .copy-btn {
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--text);
+    border-radius: 8px;
+    padding: 5px 9px;
+    cursor: pointer;
+    font-size: 12px;
+    transition: background 0.16s ease, transform 0.16s ease;
+  }
+  .copy-btn:hover { background: rgba(255, 255, 255, 0.09); }
+  .copy-btn:active { transform: translateY(1px); }
+
+  .markdown-body pre {
+    margin: 0;
+    padding: 14px 16px;
+    overflow-x: auto;
+    background: #0d1117;
+  }
+  .markdown-body pre code {
+    background: none;
+    padding: 0;
+    border: none;
+    color: inherit;
+    font-family: 'SFMono-Regular', Menlo, Consolas, monospace;
+    font-size: 13px;
+    line-height: 1.65;
+  }
+
+  .table-wrap {
+    display: block;
+    overflow-x: auto;
+    width: 100%;
+  }
+  .markdown-body table {
+    width: auto;
+    border-collapse: collapse;
+    border-spacing: 0;
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+  }
+  .markdown-body thead {
+    background: rgba(255, 255, 255, 0.045);
+  }
+  .markdown-body th,
+  .markdown-body td {
+    padding: 10px 12px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+    text-align: left;
+    vertical-align: top;
+    min-width: 90px;
+  }
+  .markdown-body tr:last-child td { border-bottom: none; }
+  .markdown-body th { color: #f0f6fc; font-weight: 700; }
+
+  .markdown-body img {
+    max-width: 100%;
+    height: auto;
+    border-radius: 12px;
+    display: block;
+    margin: 1em auto;
+    box-shadow: var(--shadow);
+  }
+
+  .markdown-body details {
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.025);
+    padding: 0.85em 1em;
+  }
+  .markdown-body summary {
+    cursor: pointer;
+    font-weight: 600;
+    color: #f0f6fc;
+  }
+
+  .markdown-body .footnotes {
+    margin-top: 1.8em;
+    padding-top: 1em;
+    border-top: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 0.94em;
+  }
+  .markdown-body .footnote-ref,
+  .markdown-body .footnote-backref {
+    text-decoration: none;
+    font-weight: 700;
+  }
+
+  .markdown-body .katex-display {
+    margin: 1.1em 0;
+    padding: 0.35em 0.25em;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+  .markdown-body .katex {
+    font-size: 1.03em;
+  }
+
+  /* Display math blocks (rendered by renderMathBlock) */
+  .markdown-body .math-block {
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 0.55em 1.1em;
+    margin: 1em 0;
+    background: rgba(86, 156, 214, 0.05);
+    border-left: 2px solid rgba(86, 156, 214, 0.28);
+    border-radius: 0 8px 8px 0;
+  }
+
+  /* Slide N headings */
+  .markdown-body h2.slide-heading {
+    display: flex;
+    align-items: center;
+    gap: 0.55em;
+    margin-top: 2.4em;
+  }
+  .markdown-body h2.slide-heading .slide-chip {
+    display: inline-flex;
+    align-items: center;
+    background: rgba(86, 156, 214, 0.12);
+    color: var(--accent);
+    border: 1px solid rgba(86, 156, 214, 0.22);
+    border-radius: 6px;
+    padding: 0.05em 0.55em;
+    font-size: 0.78em;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  #notes-zoom-label { cursor: pointer; user-select: none; border-radius: 4px; transition: background 0.12s; }
+  #notes-zoom-label:hover { background: rgba(255,255,255,0.07); }
+
+  /* Reading progress bar */
+  #notes-progress {
+    height: 2px;
+    width: 0%;
+    background: linear-gradient(90deg, var(--accent), var(--accent-2));
+    flex-shrink: 0;
+    transition: width 0.08s linear;
+    pointer-events: none;
+  }
+
+  #placeholder {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #555;
+    font-size: 14px;
+    text-align: center;
+    padding: 24px;
+  }
+  .placeholder-inner {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+  }
+  .placeholder-icon {
+    width: 52px; height: 52px;
+    border: 2px solid #3a3a3a;
+    border-radius: 14px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 22px;
+    color: #444;
+    margin-bottom: 4px;
+  }
+  .placeholder-title { color: #666; font-size: 14px; font-weight: 500; }
+  .placeholder-sub { color: #444; font-size: 12px; }
+
+  .empty-note {
+    padding: 20px;
+    border: 1px dashed rgba(255, 255, 255, 0.1);
+    border-radius: 12px;
+    color: var(--muted);
+    background: rgba(255, 255, 255, 0.02);
+  }
+  .empty-note code { margin-top: 8px; }
+
+  /* Light mode for notes pane */
+  body.notes-light #notes-scroll { background: #f6f8fa; }
+  body.notes-light #notes-toolbar { background: #f0f2f4; border-bottom-color: #d0d7de; color: #57606a; }
+  body.notes-light .markdown-body { color: #24292f; }
+  body.notes-light .markdown-body h1 { color: #0550ae; border-bottom-color: #d0d7de; }
+  body.notes-light .markdown-body h2 { color: #0969da; border-bottom-color: #d0d7de; }
+  body.notes-light .markdown-body h3 { color: #1a7f37; }
+  body.notes-light .markdown-body h4,
+  body.notes-light .markdown-body h5,
+  body.notes-light .markdown-body h6 { color: #24292f; }
+  body.notes-light .markdown-body strong { color: #000; }
+  body.notes-light .markdown-body em { color: #444; }
+  body.notes-light .markdown-body del { color: #666; }
+  body.notes-light .markdown-body a { color: #0969da; }
+  body.notes-light .markdown-body a:hover { border-bottom-color: rgba(9,105,218,0.5); }
+  body.notes-light .markdown-body blockquote {
+    color: #57606a; background: rgba(9,105,218,0.05); border-left-color: #0969da;
+  }
+  body.notes-light .markdown-body :not(pre) > code {
+    background: rgba(175,184,193,0.2); border-color: rgba(31,35,40,0.15); color: #953800;
+  }
+  body.notes-light .markdown-body table { background: #fff; border-color: #d0d7de; }
+  body.notes-light .markdown-body thead { background: rgba(0,0,0,0.04); }
+  body.notes-light .markdown-body th { color: #24292f; }
+  body.notes-light .markdown-body td { border-bottom-color: #e6e8eb; }
+  body.notes-light .markdown-body hr { border-top-color: #d0d7de; }
+  body.notes-light .markdown-body details { border-color: #d0d7de; background: rgba(0,0,0,0.02); }
+  body.notes-light .markdown-body summary { color: #24292f; }
+  body.notes-light .notes-meta { color: #57606a; }
+  body.notes-light .toc-hd { color: #57606a; }
+  body.notes-light #notes-scroll .footnotes { color: #57606a; }
+  body.notes-light .code-block { border-color: rgba(0,0,0,0.12); }
+  body.notes-light .code-header { border-bottom-color: rgba(0,0,0,0.1); }
+  body.notes-light .copy-btn { border-color: rgba(0,0,0,0.15); background: rgba(0,0,0,0.05); color: #24292f; }
+  body.notes-light .copy-btn:hover { background: rgba(0,0,0,0.1); }
+  body.notes-light .markdown-body pre code { color: #c9d1d9; }
+
+  /* PDF dark mode */
+  iframe.pdf-dark { filter: invert(1) hue-rotate(180deg); }
+
+  /* Filter count badge */
+  .filter-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--accent);
+    color: #fff;
+    border-radius: 999px;
+    font-size: 9px;
+    min-width: 14px;
+    height: 14px;
+    padding: 0 4px;
+    margin-left: 2px;
+    line-height: 1;
+    pointer-events: none;
+  }
+
+  /* TOC overlay (right-edge hover) */
+  #toc-trigger-strip {
+    position: absolute;
+    top: 50%;
+    right: 0;
+    transform: translateY(-50%);
+    width: 14px;
+    height: 56px;
+    z-index: 50;
+    cursor: pointer;
+    background: var(--panel-3);
+    border: 1px solid var(--border);
+    border-right: none;
+    border-radius: 8px 0 0 8px;
+    opacity: 0;
+    transition: opacity 0.2s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  #toc-trigger-strip::after {
+    content: '‹';
+    color: var(--muted);
+    font-size: 13px;
+    line-height: 1;
+    pointer-events: none;
+  }
+  #notes-pane:hover #toc-trigger-strip { opacity: 1; }
+  #toc-sidebar.visible ~ #toc-trigger-strip { opacity: 0 !important; }
+
+  #toc-sidebar {
+    position: absolute;
+    top: 0; right: 0;
+    width: 240px; height: 100%;
+    background: rgba(22, 24, 28, 0.97);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    border-left: 1px solid rgba(86, 156, 214, 0.18);
+    transform: translateX(100%);
+    transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.2s ease;
+    z-index: 45;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  #toc-sidebar.visible {
+    transform: translateX(0);
+    box-shadow: -6px 0 28px rgba(0, 0, 0, 0.45);
+  }
+
+  .toc-hd {
+    padding: 12px 14px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--muted-2);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    flex-shrink: 0;
+  }
+  #toc-list-container { padding: 6px 0 20px 0; overflow-y: auto; flex: 1; }
+  .toc-list { list-style: none; padding: 0; margin: 0; }
+  .toc-item > a {
+    display: block;
+    padding: 4px 10px;
+    font-size: 12px;
+    color: var(--muted);
+    text-decoration: none;
+    border-left: 2px solid transparent;
+    transition: color 0.13s, border-color 0.13s, background 0.13s;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    line-height: 1.5;
+  }
+  .toc-item > a:hover { color: var(--text); border-left-color: var(--accent); background: var(--accent-soft); }
+  .toc-item > a.active { color: #fff; border-left-color: var(--accent); background: var(--accent-soft); }
+  .toc-item.toc-h1 > a { font-weight: 700; color: var(--accent-2); font-size: 11.5px; padding: 6px 10px 3px; }
+  .toc-item.toc-h2 > a { padding-left: 16px; }
+  .toc-item.toc-h3 > a { padding-left: 26px; font-size: 11.5px; color: var(--muted-2); }
+  .toc-item > a[data-pdf-page]::after {
+    content: ' ⟶';
+    font-size: 10px;
+    color: var(--accent);
+    opacity: 0.6;
+    margin-left: 2px;
+  }
+
+  /* Back to top */
+  #back-to-top {
+    display: none;
+    position: fixed;
+    bottom: 22px;
+    right: 22px;
+    width: 34px;
+    height: 34px;
+    background: var(--panel-3);
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    color: var(--muted);
+    font-size: 15px;
+    cursor: pointer;
+    align-items: center;
+    justify-content: center;
+    z-index: 200;
+    transition: background 0.15s, color 0.15s;
+    box-shadow: var(--shadow);
+  }
+  #back-to-top.visible { display: flex; }
+  #back-to-top:hover { background: var(--panel-4); color: var(--text); }
+
+  /* Refresh button */
+  .refresh-btn {
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    border-radius: 6px;
+    padding: 3px 8px;
+    font-size: 12px;
+    cursor: pointer;
+    line-height: 1.5;
+    transition: background 0.15s, color 0.15s, transform 0.15s;
+    flex-shrink: 0;
+  }
+  .refresh-btn:hover { background: rgba(255,255,255,0.06); color: var(--text); }
+  .refresh-btn.active { color: var(--accent); border-color: var(--accent); }
+  .refresh-btn.spinning { animation: spin 0.6s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  ::-webkit-scrollbar { width: 12px; height: 12px; }
+  ::-webkit-scrollbar-thumb {
+    background: #3b414a;
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+  ::-webkit-scrollbar-track { background: transparent; }
+</style>
+</head>
+<body>
+<div class="layout">
+  <button id="sidebar-open-btn" onclick="toggleSidebar()">▶</button>
+  <div id="sidebar">
+    <h2>autonotes <span class="sidebar-actions"><button id="filter-btn" onclick="toggleHideNoNotes()" title="노트 없는 파일 숨기기">⊘<span class="filter-badge" id="filter-badge" style="display:none"></span></button><button id="toggle-btn" onclick="toggleSidebar()" title="사이드바 닫기">◀</button></span></h2>
+    <div id="file-list">불러오는 중...</div>
+  </div>
+  <div class="panes" id="panes">
+    <div id="placeholder">
+      <div class="placeholder-inner">
+        <div class="placeholder-icon">◫</div>
+        <div class="placeholder-title">파일을 선택하세요</div>
+        <div class="placeholder-sub">← 왼쪽 사이드바에서 강의 자료를 선택하면<br>PDF와 노트를 함께 볼 수 있습니다</div>
+      </div>
+    </div>
+  </div>
+</div>
+<button id="back-to-top" title="맨 위로">↑</button>
+
+<script>
+let currentItem = null;
+let currentFile = null;
+let hideNoNotes = false;
+let noNotesCount = 0;
+let notesLight = localStorage.getItem('autonotes_light') === '1';
+let pdfDark = localStorage.getItem('autonotes_pdfdark') !== '0'; // default: true
+let notesZoom = parseFloat(localStorage.getItem('autonotes_zoom')) || 15; // px
+let pdfSyncEnabled = localStorage.getItem('autonotes_sync') !== '0'; // default: true
+let pdfSyncSuppressUntil = 0;
+let currentHeadings = [];
+
+const md = window.markdownit({
+  html: true,
+  linkify: true,
+  typographer: true,
+  breaks: true
+});
+
+if (typeof window.markdownitTaskLists === 'function') {
+  md.use(window.markdownitTaskLists, { enabled: true, label: true, labelAfter: true });
+}
+if (typeof window.markdownitFootnote === 'function') {
+  md.use(window.markdownitFootnote);
+}
+if (typeof window.texmath !== 'undefined') {
+  md.use(window.texmath, {
+    engine: window.katex,
+    delimiters: 'dollars',
+    katexOptions: {
+      throwOnError: false,
+      strict: 'ignore',
+      trust: false,
+      output: 'html'
+    }
+  });
+}
+
+function preprocessMarkdown(text) {
+  // 1. Bold fix: closing ** preceded by punctuation + followed by Korean = not right-flanking.
+  //    Insert U+200B before closing ** to break the punctuation adjacency.
+  const parts = text.split(/(```[\s\S]*?```|`[^`\n]+`)/g);
+  const boldFixed = parts.map((part, i) => {
+    if (i % 2 === 1) return part;
+    return part.replace(/([)}\]'"'"»›…，、。！？])\*\*([가-힣ㄱ-ㅣ])/g, '$1\u200b**$2');
+  }).join('');
+
+  // 2. Heading normalization:
+  //    - First H1 (document title) is kept as-is.
+  //    - Any subsequent H1 → demoted to H3 (section title within a slide).
+  //    - H2 that is NOT "## Slide N" → demoted to H3 (slide sub-title, not a new section).
+  //    Result: H1=doc title, H2=Slide N anchors, H3=everything else.
+  let firstH1Seen = false;
+  return boldFixed.split('\n').map(line => {
+    if (/^# [^#]/.test(line)) {
+      if (!firstH1Seen) { firstH1Seen = true; return line; }
+      return '### ' + line.slice(2);
+    }
+    if (/^## [^#]/.test(line) && !/^## Slide\s+\d+/.test(line)) {
+      return '### ' + line.slice(3);
+    }
+    return line;
+  }).join('\n');
+}
+
+function escapeHtml(text) {
+  return String(text || '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#039;');
+}
+
+function normalizeLanguageLabel(lang) {
+  const value = String(lang || '').trim().toLowerCase();
+  if (!value || value === 'plaintext' || value === 'text') return 'plain';
+  if (value === 'py') return 'python';
+  if (value === 'js') return 'javascript';
+  if (value === 'ts') return 'typescript';
+  if (value === 'shell' || value === 'console') return 'bash';
+  return value;
+}
+
+function escapeHtmlAttr(text) {
+  return escapeHtml(text).replaceAll('`', '&#096;');
+}
+
+function detectCodeHighlight(code, explicitLang = '') {
+  const normalizedExplicit = normalizeLanguageLabel(explicitLang);
+  const source = String(code || '');
+
+  if (normalizedExplicit && normalizedExplicit !== 'plain' && window.hljs && hljs.getLanguage(normalizedExplicit)) {
+    try {
+      const result = hljs.highlight(source, { language: normalizedExplicit, ignoreIllegals: true });
+      return { html: result.value, language: normalizedExplicit };
+    } catch (err) {}
+  }
+
+  if (window.hljs) {
+    try {
+      const auto = hljs.highlightAuto(source);
+      const detected = normalizeLanguageLabel(auto.language || 'plain');
+      return {
+        html: auto.value || escapeHtml(source),
+        language: detected || 'plain'
+      };
+    } catch (err) {}
+  }
+
+  return { html: escapeHtml(source), language: normalizedExplicit || 'plain' };
+}
+
+function isExplicitMathLanguage(info) {
+  const value = normalizeLanguageLabel(info);
+  return ['math', 'latex', 'tex', 'katex'].includes(value);
+}
+
+function isLikelyMathFence(info, content) {
+  if (isExplicitMathLanguage(info)) return true;
+  if (String(info || '').trim()) return false;
+
+  const text = String(content || '').trim();
+  if (!text) return false;
+
+  const lines = text.split(/\r?\n/).filter(line => line.trim());
+  if (lines.length > 12) return false;
+
+  const mathSignals = [
+    /\\[a-zA-Z]+/,
+    /[Σ∑Π∏∫√∞≤≥≠≈∈∀∃α-ωΑ-Ω]/,
+    /[_^]\{?[^}\s]+\}?/,
+    /\barg\s*(max|min)\b/i,
+    /\b(sin|cos|tan|log|ln|max|min)\b/i,
+    /(?:^|\s)[A-Za-z][A-Za-z0-9_]*\([^\n)]*\)\s*=/m,
+    /\bN_[A-Za-z0-9]+\(/,
+    /\b[xywfpqτ]\b|x_i|y_i|w_i|f̂|ŷ|τ/,
+    /\{\s*\n[\s\S]*\n\}/,
+    /\b(d\(|epsilon|varepsilon)\b|ε/
+  ];
+
+  const codeSignals = [
+    /^\s*(def|class|import|from|return|for|while|if|elif|else|try|except|with)\b/m,
+    /^\s*(const|let|var|function|async|await|export|import)\b/m,
+    /^\s*(public|private|protected|static|void|int|string|bool|interface)\b/m,
+    /=>/,
+    /;\s*(?:\n|$)/,
+    /#include\b/,
+    /console\.log\b/,
+    /System\.out\b/,
+    /<\/?[A-Za-z][^>]*>/
+  ];
+
+  let mathScore = 0;
+  let codeScore = 0;
+  for (const pattern of mathSignals) {
+    if (pattern.test(text)) mathScore += 1;
+  }
+  for (const pattern of codeSignals) {
+    if (pattern.test(text)) codeScore += 1;
+  }
+
+  return mathScore >= 2 && mathScore > codeScore;
+}
+
+function renderMathBlock(content) {
+  const expr = String(content || '').trim();
+  if (!expr) return '';
+  try {
+    return `<div class="math-block">${window.katex.renderToString(expr, {
+      displayMode: true,
+      throwOnError: false,
+      strict: 'ignore',
+      trust: false,
+      output: 'html'
+    })}</div>`;
+  } catch (err) {
+    return `<pre data-lang="plain"><code class="language-plain">${escapeHtml(expr)}</code></pre>`;
+  }
+}
+
+md.renderer.rules.fence = function(tokens, idx) {
+  const token = tokens[idx];
+  const info = String(token.info || '').trim();
+  const content = token.content || '';
+
+  if (isLikelyMathFence(info, content)) {
+    return renderMathBlock(content);
+  }
+
+  const detected = detectCodeHighlight(content, info);
+  const lang = normalizeLanguageLabel(info) || detected.language || 'plain';
+  return `<pre data-lang="${escapeHtmlAttr(lang)}"><code class="hljs language-${escapeHtmlAttr(lang)}">${detected.html}</code></pre>`;
+};
+
+function renderMarkdown(markdown) {
+  const rawHtml = md.render(preprocessMarkdown(markdown));
+  const safeHtml = window.DOMPurify.sanitize(rawHtml, {
+    USE_PROFILES: { html: true },
+    ADD_ATTR: ['target', 'rel', 'class', 'data-lang']
+  });
+  return safeHtml;
+}
+
+function applyTheme() {
+  document.body.classList.toggle('notes-light', notesLight);
+  const iframe = document.getElementById('pdf-frame');
+  if (iframe) iframe.classList.toggle('pdf-dark', pdfDark);
+  const btn = document.getElementById('notes-toolbar')?.querySelector('.theme-btn');
+  if (btn) btn.textContent = notesLight ? '☾' : '☀';
+}
+
+function changeNotesZoom(delta) {
+  notesZoom = Math.min(28, Math.max(10, notesZoom + delta));
+  localStorage.setItem('autonotes_zoom', notesZoom);
+  const body = document.querySelector('.markdown-body');
+  if (body) body.style.fontSize = notesZoom + 'px';
+  const label = document.getElementById('notes-zoom-label');
+  if (label) label.textContent = Math.round((notesZoom / 15) * 100) + '%';
+}
+
+function toggleTheme() {
+  notesLight = !notesLight;
+  pdfDark = !notesLight; // dark notes → dark PDF, light notes → light PDF
+  localStorage.setItem('autonotes_light', notesLight ? '1' : '0');
+  localStorage.setItem('autonotes_pdfdark', pdfDark ? '1' : '0');
+  applyTheme();
+}
+
+function printNotes() {
+  const body = document.querySelector('.markdown-body');
+  if (!body) return;
+  const win = window.open('', '_blank');
+  win.document.write(`<!DOCTYPE html><html><head><meta charset="UTF-8">
+<title>${currentFile?.stem || 'notes'}</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/markdown-it-texmath/css/texmath.min.css">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:14px;line-height:1.75;color:#1a1a1a;background:#fff;padding:28px 40px 48px}
+h1,h2,h3,h4,h5,h6{line-height:1.3;margin:1.2em 0 0.5em;font-weight:700}
+h1{font-size:1.65em;border-bottom:2px solid #ddd;padding-bottom:0.3em}
+h2{font-size:1.3em;border-bottom:1px solid #eee;padding-bottom:0.2em}
+h3{font-size:1.1em}
+p,ul,ol,blockquote,table,pre,details{margin:0.75em 0}
+ul,ol{padding-left:1.5em}
+li{margin:0.2em 0}
+blockquote{border-left:4px solid #ccc;padding:0.6em 1em;color:#555;background:#f9f9f9}
+code{font-family:Menlo,Consolas,monospace;font-size:0.88em;background:#f4f4f4;padding:0.1em 0.35em;border-radius:4px}
+pre{background:#f4f4f4;padding:12px 14px;border-radius:6px;overflow-x:auto}
+pre code{background:none;padding:0}
+table{border-collapse:collapse;width:auto}
+th,td{border:1px solid #ccc;padding:7px 10px;text-align:left}
+th{background:#f0f0f0;font-weight:700}
+img{max-width:100%;height:auto}
+a{color:#0969da;text-decoration:none}
+hr{border:none;border-top:1px solid #ddd;margin:1.2em 0}
+@media print{body{padding:12px 18px}a{color:#000}}
+</style></head><body>${body.innerHTML}</body></html>`);
+  win.document.close();
+  win.focus();
+  win.onload = () => { win.print(); };
+}
+
+function toggleSync() {
+  pdfSyncEnabled = !pdfSyncEnabled;
+  localStorage.setItem('autonotes_sync', pdfSyncEnabled ? '1' : '0');
+  const btn = document.getElementById('notes-toolbar')?.querySelector('.sync-btn');
+  if (btn) {
+    btn.classList.toggle('active', pdfSyncEnabled);
+    btn.title = pdfSyncEnabled ? 'PDF↔노트 동기화 켜짐' : 'PDF↔노트 동기화 꺼짐';
+  }
+}
+
+// PDF→notes reverse sync via postMessage from /pdfview iframe
+window.addEventListener('message', e => {
+  if (e.data?.type !== 'pagechange') return;
+  if (!pdfSyncEnabled) return;
+  if (Date.now() < pdfSyncSuppressUntil) return;
+  scrollNotesToPage(e.data.page);
+});
+
+function scrollNotesToPage(page) {
+  const scrollEl = document.getElementById('notes-scroll');
+  if (!scrollEl) return;
+  const target = currentHeadings.find(h => {
+    const m = h.textContent.trim().match(/^Slide\s+(\d+)/i);
+    return m && parseInt(m[1], 10) === page;
+  });
+  if (!target) return;
+  const paneTop = scrollEl.getBoundingClientRect().top;
+  const headingTop = target.getBoundingClientRect().top;
+  scrollEl.scrollBy({ top: headingTop - paneTop - 12, behavior: 'smooth' });
+}
+
+function updateFilterBadge() {
+  const badge = document.getElementById('filter-badge');
+  if (!badge) return;
+  if (noNotesCount > 0) {
+    badge.textContent = noNotesCount;
+    badge.style.display = '';
+  } else {
+    badge.style.display = 'none';
+  }
+}
+
+function buildToc(root) {
+  const container = document.getElementById('toc-list-container');
+  if (!container) return;
+
+  const body = root.querySelector('.markdown-body');
+  if (!body) { container.innerHTML = ''; return; }
+
+  const headings = Array.from(body.querySelectorAll('h1, h2, h3'));
+  if (headings.length < 2) { container.innerHTML = ''; return; }
+  currentHeadings = headings;
+
+  // Assign stable IDs to headings
+  const seen = {};
+  headings.forEach(h => {
+    const base = h.textContent.trim()
+      .replace(/[^가-힣a-zA-Z0-9]/g, '-').replace(/-+/g, '-').slice(0, 48).toLowerCase();
+    const key = seen[base] = (seen[base] || 0) + 1;
+    h.id = key === 1 ? base : `${base}-${key}`;
+  });
+
+  const ul = document.createElement('ul');
+  ul.className = 'toc-list';
+
+  const scrollEl = document.getElementById('notes-scroll');
+  headings.forEach(h => {
+    const li = document.createElement('li');
+    li.className = `toc-item toc-${h.tagName.toLowerCase()}`;
+    const a = document.createElement('a');
+    const slideMatch = h.textContent.trim().match(/^Slide\s+(\d+)/i);
+    const pageNum = slideMatch ? parseInt(slideMatch[1], 10) : null;
+    a.textContent = h.textContent.trim();
+    if (pageNum !== null) a.dataset.pdfPage = pageNum;
+    a.href = `#${h.id}`;
+    a.addEventListener('click', e => {
+      e.preventDefault();
+      if (scrollEl) {
+        const paneTop = scrollEl.getBoundingClientRect().top;
+        const headingTop = h.getBoundingClientRect().top;
+        scrollEl.scrollBy({ top: headingTop - paneTop - 12, behavior: 'smooth' });
+        // smooth scroll의 마지막 scroll 이벤트가 최종 위치에서 발생하지 않을 수 있으므로
+        // scrollend(또는 timeout fallback)로 TOC 하이라이트 재확인
+        clearTimeout(scrollEl._tocSpyTimer);
+        const confirmActive = () => { clearTimeout(scrollEl._tocSpyTimer); scrollEl._tocSpy?.(); };
+        scrollEl._tocSpyTimer = setTimeout(confirmActive, 500);
+        scrollEl.addEventListener('scrollend', confirmActive, { once: true });
+      } else {
+        h.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+      // Sync PDF to corresponding page for Slide headings
+      if (pageNum !== null) {
+        const iframe = document.getElementById('pdf-frame');
+        if (iframe) {
+          // Suppress reverse-sync for 2.5s to avoid feedback loop
+          pdfSyncSuppressUntil = Date.now() + 2500;
+          iframe.contentWindow.postMessage({ type: 'gotopage', page: pageNum }, '*');
+        }
+      }
+    });
+    li.appendChild(a);
+    ul.appendChild(li);
+  });
+
+  container.innerHTML = '';
+  container.appendChild(ul);
+
+  // Scroll spy: highlight active TOC item as user scrolls
+  if (scrollEl) {
+    const links = Array.from(container.querySelectorAll('.toc-item > a'));
+    function updateActive() {
+      const containerTop = scrollEl.getBoundingClientRect().top;
+      let active = null;
+      for (const h of headings) {
+        if (h.getBoundingClientRect().top - containerTop <= 48) active = h.id;
+        else break;
+      }
+      links.forEach(a => {
+        a.classList.toggle('active', a.getAttribute('href') === '#' + active);
+      });
+    }
+    scrollEl.removeEventListener('scroll', scrollEl._tocSpy);
+    scrollEl._tocSpy = updateActive;
+    scrollEl.addEventListener('scroll', updateActive);
+    updateActive();
+  }
+
+}
+
+function enhanceRenderedNotes(root) {
+  buildToc(root);
+
+  // Style "Slide N" headings with a chip badge
+  root.querySelectorAll('.markdown-body h2').forEach(h => {
+    const m = h.textContent.trim().match(/^(Slide\s+\d+)(.*)/i);
+    if (m) {
+      h.classList.add('slide-heading');
+      const chip = document.createElement('span');
+      chip.className = 'slide-chip';
+      chip.textContent = m[1];
+      const rest = m[2].trim();
+      h.textContent = '';
+      h.appendChild(chip);
+      if (rest) h.appendChild(document.createTextNode('\u00a0' + rest));
+    }
+  });
+
+  root.querySelectorAll('a[href]').forEach(link => {
+    const href = link.getAttribute('href') || '';
+    if (/^https?:\/\//i.test(href)) {
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+    }
+  });
+
+  root.querySelectorAll('table').forEach(table => {
+    if (table.parentElement?.classList.contains('table-wrap')) return;
+    const wrap = document.createElement('div');
+    wrap.className = 'table-wrap';
+    table.parentNode.insertBefore(wrap, table);
+    wrap.appendChild(table);
+  });
+
+  root.querySelectorAll('pre').forEach(pre => {
+    if (pre.parentElement?.classList.contains('code-block')) return;
+
+    const code = pre.querySelector('code');
+    if (!code) return;
+
+    let lang = normalizeLanguageLabel(pre.dataset.lang || '');
+    if (!lang || lang === 'plain') {
+      const classNames = Array.from(code.classList || []);
+      const langClass = classNames.find(name => name.startsWith('language-')) || '';
+      lang = normalizeLanguageLabel(langClass.replace('language-', ''));
+    }
+
+    const rawText = code.textContent || '';
+    const needsHighlight = !code.classList.contains('hljs') || !lang || lang === 'plain';
+    if (needsHighlight) {
+      const detected = detectCodeHighlight(rawText, lang);
+      lang = normalizeLanguageLabel(lang || detected.language || 'plain');
+      code.innerHTML = detected.html;
+      code.className = `hljs language-${lang}`;
+      pre.dataset.lang = lang;
+    }
+
+    lang = normalizeLanguageLabel(lang || 'plain');
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'code-block';
+
+    const header = document.createElement('div');
+    header.className = 'code-header';
+    header.innerHTML = `
+      <span class="code-lang">${escapeHtml(lang)}</span>
+      <button type="button" class="copy-btn">복사</button>
+    `;
+
+    pre.parentNode.insertBefore(wrapper, pre);
+    wrapper.appendChild(header);
+    wrapper.appendChild(pre);
+
+    const copyBtn = header.querySelector('.copy-btn');
+    copyBtn.addEventListener('click', async () => {
+      const text = rawText || code.innerText || pre.innerText;
+      try {
+        await navigator.clipboard.writeText(text);
+        const prev = copyBtn.textContent;
+        copyBtn.textContent = '복사됨';
+        setTimeout(() => { copyBtn.textContent = prev; }, 1200);
+      } catch (err) {
+        copyBtn.textContent = '실패';
+        setTimeout(() => { copyBtn.textContent = '복사'; }, 1200);
+      }
+    });
+  });
+}
+
+async function loadFiles() {
+  const res = await fetch('/api/files');
+  const groups = await res.json();
+  const list = document.getElementById('file-list');
+  list.innerHTML = '';
+
+  if (groups.length === 0) {
+    list.innerHTML = '<div style="padding:12px 14px;color:#666;font-size:13px">PDF 파일이 없습니다</div>';
+    return;
+  }
+
+  noNotesCount = 0;
+
+  for (const group of groups) {
+    const g = document.createElement('div');
+    g.className = 'course-group';
+
+    const label = document.createElement('div');
+    label.className = 'course-label';
+    label.textContent = group.course;
+    g.appendChild(label);
+
+    for (const f of group.files) {
+      const item = document.createElement('div');
+      item.className = 'file-item' + (f.has_notes ? '' : ' no-notes');
+      item.textContent = f.stem;
+      item.title = f.pdf;
+      if (!f.has_notes) noNotesCount++;
+      if (!f.has_notes && hideNoNotes) item.style.display = 'none';
+      item.addEventListener('click', () => openFile(f, item));
+      g.appendChild(item);
+    }
+    list.appendChild(g);
+  }
+
+  updateFilterBadge();
+}
+
+function toggleHideNoNotes() {
+  hideNoNotes = !hideNoNotes;
+  document.getElementById('filter-btn').classList.toggle('active', hideNoNotes);
+  document.querySelectorAll('.file-item.no-notes').forEach(el => {
+    el.style.display = hideNoNotes ? 'none' : '';
+  });
+  const badge = document.getElementById('filter-badge');
+  if (badge) badge.style.display = hideNoNotes ? 'none' : (noNotesCount > 0 ? '' : 'none');
+}
+
+async function renderNotesInto(f, paneEl) {
+  const res = await fetch('/file?path=' + encodeURIComponent(f.md) + '&raw=1');
+  const markdown = await res.text();
+  const rendered = renderMarkdown(markdown);
+
+  const filenameEl = document.getElementById('notes-toolbar-filename');
+  if (filenameEl) filenameEl.textContent = f.stem + '.md';
+
+  const scrollEl = paneEl.querySelector('#notes-scroll') || paneEl;
+  scrollEl.innerHTML = `
+    <div class="notes-shell">
+      <article class="markdown-body">${rendered}</article>
+    </div>
+  `;
+  enhanceRenderedNotes(scrollEl);
+  const body = scrollEl.querySelector('.markdown-body');
+  if (body && notesZoom !== 15) body.style.fontSize = notesZoom + 'px';
+  scrollEl.scrollTop = 0;
+}
+
+async function openFile(f, item) {
+  if (currentItem) currentItem.classList.remove('active');
+  item.classList.add('active');
+  currentItem = item;
+  currentFile = f;
+
+  const panes = document.getElementById('panes');
+  const placeholder = document.getElementById('placeholder');
+  if (placeholder) placeholder.remove();
+
+  let iframe = document.getElementById('pdf-frame');
+  let divider = document.getElementById('divider');
+  let notesPaneEl = document.getElementById('notes-pane');
+
+  if (!iframe) {
+    iframe = document.createElement('iframe');
+    iframe.id = 'pdf-frame';
+    if (pdfDark) iframe.classList.add('pdf-dark');
+
+    divider = document.createElement('div');
+    divider.id = 'divider';
+    divider.className = 'divider';
+
+    notesPaneEl = document.createElement('div');
+    notesPaneEl.id = 'notes-pane';
+
+    panes.appendChild(iframe);
+    panes.appendChild(divider);
+    panes.appendChild(notesPaneEl);
+
+    const restoreStrip = document.createElement('div');
+    restoreStrip.id = 'pdf-restore-strip';
+    panes.appendChild(restoreStrip);
+    restoreStrip.addEventListener('click', () => {
+      const d = document.getElementById('divider');
+      if (d && d._setViewMode) d._setViewMode('split');
+    });
+
+    setupDivider(divider, iframe, notesPaneEl);
+
+    // Restore saved pane ratio
+    const savedRatio = parseFloat(localStorage.getItem('autonotes_ratio'));
+    if (savedRatio) {
+      iframe.style.flex = 'none';
+      iframe.style.width = savedRatio + '%';
+      notesPaneEl.style.flex = 'none';
+      notesPaneEl.style.width = (100 - savedRatio - 0.4) + '%';
+    }
+
+    // Set up inner structure: sticky toolbar + scroll area + overlay TOC
+    notesPaneEl.innerHTML = `
+      <div id="notes-toolbar">
+        <span id="notes-toolbar-filename"></span>
+        <div class="toolbar-actions">
+          <button class="refresh-btn view-btn" id="notes-view-pdf" title="PDF만 보기">◧</button>
+          <button class="refresh-btn view-btn" id="notes-view-notes" title="노트만 보기">◨</button>
+          <button class="refresh-btn" id="notes-zoom-out" title="노트 축소">−</button>
+          <span id="notes-zoom-label" style="font-size:11px;color:var(--muted-2);min-width:34px;text-align:center" title="클릭하여 100% 초기화">${Math.round((notesZoom/15)*100)}%</span>
+          <button class="refresh-btn" id="notes-zoom-in" title="노트 확대">+</button>
+          <button class="refresh-btn sync-btn${pdfSyncEnabled ? ' active' : ''}" title="${pdfSyncEnabled ? 'PDF↔노트 동기화 켜짐' : 'PDF↔노트 동기화 꺼짐'}">⇄</button>
+          <button class="refresh-btn theme-btn" title="라이트/다크 + PDF 다크모드 전환">${notesLight ? '☾' : '☀'}</button>
+          <button class="refresh-btn notes-print-btn" title="인쇄/저장 (P)">⎙</button>
+        </div>
+      </div>
+      <div id="notes-progress"></div>
+      <div id="notes-scroll"></div>
+      <div id="toc-sidebar">
+        <div class="toc-hd">목차</div>
+        <div id="toc-list-container"></div>
+      </div>
+      <div id="toc-trigger-strip"></div>
+    `;
+
+    // Toolbar button listeners (set up once)
+    notesPaneEl.querySelector('#notes-zoom-out').addEventListener('click', () => changeNotesZoom(-1));
+    notesPaneEl.querySelector('#notes-zoom-in').addEventListener('click', () => changeNotesZoom(+1));
+    notesPaneEl.querySelector('#notes-zoom-label').addEventListener('click', () => {
+      notesZoom = 15;
+      localStorage.setItem('autonotes_zoom', '15');
+      const body = document.querySelector('.markdown-body');
+      if (body) body.style.fontSize = '';
+      const label = document.getElementById('notes-zoom-label');
+      if (label) label.textContent = '100%';
+    });
+    notesPaneEl.querySelector('.sync-btn').addEventListener('click', toggleSync);
+    notesPaneEl.querySelector('.theme-btn').addEventListener('click', toggleTheme);
+    notesPaneEl.querySelector('.notes-print-btn').addEventListener('click', printNotes);
+    notesPaneEl.querySelector('#notes-view-pdf').addEventListener('click', () => {
+      const d = document.getElementById('divider');
+      if (d && d._setViewMode) d._setViewMode(d._viewMode === 'pdf-only' ? 'split' : 'pdf-only');
+    });
+    notesPaneEl.querySelector('#notes-view-notes').addEventListener('click', () => {
+      const d = document.getElementById('divider');
+      if (d && d._setViewMode) d._setViewMode(d._viewMode === 'notes-only' ? 'split' : 'notes-only');
+    });
+
+    // TOC hover show/hide (with small delay to handle cursor gap)
+    let tocTimer = null;
+    const strip = notesPaneEl.querySelector('#toc-trigger-strip');
+    const tocEl = notesPaneEl.querySelector('#toc-sidebar');
+    function showToc() { clearTimeout(tocTimer); tocEl.classList.add('visible'); }
+    function hideToc() { tocTimer = setTimeout(() => tocEl.classList.remove('visible'), 220); }
+    strip.addEventListener('mouseenter', showToc);
+    strip.addEventListener('mouseleave', hideToc);
+    tocEl.addEventListener('mouseenter', showToc);
+    tocEl.addEventListener('mouseleave', hideToc);
+
+    // Back to top + reading progress bar
+    const scrollEl = notesPaneEl.querySelector('#notes-scroll');
+    const progressEl = notesPaneEl.querySelector('#notes-progress');
+    const backBtn = document.getElementById('back-to-top');
+    scrollEl.addEventListener('scroll', () => {
+      backBtn.classList.toggle('visible', scrollEl.scrollTop > 300);
+      if (progressEl) {
+        const max = scrollEl.scrollHeight - scrollEl.clientHeight;
+        progressEl.style.width = max > 0 ? (scrollEl.scrollTop / max * 100) + '%' : '0%';
+      }
+    });
+    backBtn.addEventListener('click', () => {
+      scrollEl.scrollTo({ top: 0, behavior: 'smooth' });
+    });
+  }
+
+  iframe.src = '/pdfview?path=' + encodeURIComponent(f.pdf);
+
+  if (f.has_notes) {
+    await renderNotesInto(f, notesPaneEl);
+  } else {
+    notesPaneEl.innerHTML = `
+      <div class="notes-shell">
+        <div class="empty-note">
+          <p>아직 생성된 노트가 없습니다.</p>
+          <code>python script.py ${f.pdf}</code>
+        </div>
+      </div>
+    `;
+  }
+}
+
+function toggleSidebar() {
+  const sidebar = document.getElementById('sidebar');
+  const openBtn = document.getElementById('sidebar-open-btn');
+  sidebar.classList.toggle('collapsed');
+  openBtn.classList.toggle('visible', sidebar.classList.contains('collapsed'));
+}
+
+function setupDivider(divider, iframe, notesPane) {
+  let dragging = false;
+  let viewMode = 'split'; // 'split' | 'pdf-only' | 'notes-only'
+
+  function setViewMode(mode) {
+    viewMode = mode;
+    divider._viewMode = mode;
+    const pdfOnly = mode === 'pdf-only';
+    const notesOnly = mode === 'notes-only';
+    const restoreStrip = document.getElementById('pdf-restore-strip');
+
+    iframe.style.display = notesOnly ? 'none' : '';
+    divider.style.display = (pdfOnly || notesOnly) ? 'none' : '';
+    notesPane.style.display = pdfOnly ? 'none' : '';
+
+    if (mode === 'split') {
+      const saved = parseFloat(localStorage.getItem('autonotes_ratio')) || 50;
+      iframe.style.flex = 'none';
+      iframe.style.width = saved + '%';
+      notesPane.style.flex = 'none';
+      notesPane.style.width = (100 - saved - 0.4) + '%';
+    } else {
+      iframe.style.flex = '';
+      iframe.style.width = '';
+      notesPane.style.flex = '';
+      notesPane.style.width = '';
+    }
+
+    if (restoreStrip) restoreStrip.classList.toggle('visible', pdfOnly);
+
+    const pdfBtn = document.getElementById('notes-view-pdf');
+    const notesBtn = document.getElementById('notes-view-notes');
+    if (pdfBtn) pdfBtn.classList.toggle('active', pdfOnly);
+    if (notesBtn) notesBtn.classList.toggle('active', notesOnly);
+  }
+
+  divider._setViewMode = setViewMode;
+  divider._viewMode = viewMode;
+
+  // Double-click: toggle notes-only mode
+  divider.addEventListener('dblclick', () => {
+    setViewMode(viewMode === 'notes-only' ? 'split' : 'notes-only');
+  });
+
+  divider.addEventListener('mousedown', e => {
+    if (e.detail >= 2) return; // ignore dblclick drag
+    dragging = true;
+    divider.classList.add('dragging');
+    iframe.style.pointerEvents = 'none';
+    e.preventDefault();
+  });
+
+  document.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    const panes = document.getElementById('panes');
+    const rect = panes.getBoundingClientRect();
+    const ratio = ((e.clientX - rect.left) / rect.width) * 100;
+    const clamp = Math.min(Math.max(ratio, 20), 80);
+    iframe.style.flex = 'none';
+    iframe.style.width = clamp + '%';
+    notesPane.style.flex = 'none';
+    notesPane.style.width = (100 - clamp - 0.4) + '%';
+    localStorage.setItem('autonotes_ratio', clamp);
+  });
+
+  document.addEventListener('mouseup', () => {
+    if (!dragging) return;
+    dragging = false;
+    divider.classList.remove('dragging');
+    iframe.style.pointerEvents = '';
+  });
+}
+
+function navigateSlide(dir) {
+  const scrollEl = document.getElementById('notes-scroll');
+  if (!scrollEl || currentHeadings.length === 0) return;
+  const slides = currentHeadings.filter(h => /^Slide\s+\d+/i.test(h.textContent.trim()));
+  if (slides.length === 0) return;
+  const containerTop = scrollEl.getBoundingClientRect().top;
+  let activeIdx = -1;
+  for (let i = 0; i < slides.length; i++) {
+    if (slides[i].getBoundingClientRect().top - containerTop <= 60) activeIdx = i;
+    else break;
+  }
+  const targetIdx = Math.max(0, Math.min(slides.length - 1, activeIdx + dir));
+  const target = slides[targetIdx];
+  if (target) {
+    const paneTop = scrollEl.getBoundingClientRect().top;
+    scrollEl.scrollBy({ top: target.getBoundingClientRect().top - paneTop - 12, behavior: 'smooth' });
+    const numMatch = target.textContent.trim().match(/^Slide\s+(\d+)/i);
+    if (numMatch && pdfSyncEnabled) {
+      const iframe = document.getElementById('pdf-frame');
+      if (iframe) {
+        pdfSyncSuppressUntil = Date.now() + 2500;
+        iframe.contentWindow.postMessage({ type: 'gotopage', page: parseInt(numMatch[1]) }, '*');
+      }
+    }
+  }
+}
+
+document.addEventListener('keydown', e => {
+  if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) return;
+  const mod = e.ctrlKey || e.metaKey;
+  if (e.key === '[' && !mod) { e.preventDefault(); navigateSlide(-1); }
+  else if (e.key === ']' && !mod) { e.preventDefault(); navigateSlide(+1); }
+  else if ((e.key === 'ArrowLeft') && mod && !e.shiftKey) { e.preventDefault(); navigateSlide(-1); }
+  else if ((e.key === 'ArrowRight') && mod && !e.shiftKey) { e.preventDefault(); navigateSlide(+1); }
+  else if (e.key === 't' && !mod && !e.shiftKey) {
+    e.preventDefault();
+    const toc = document.getElementById('toc-sidebar');
+    if (toc) toc.classList.toggle('visible');
+  }
+  else if (e.key === 'p' && !mod) { e.preventDefault(); printNotes(); }
+  else if ((e.key === '\\') && mod) { e.preventDefault(); toggleSidebar(); }
+});
+
+loadFiles();
+applyTheme();
+</script>
+<script>
+if ('serviceWorker' in navigator) {
+  let swRefreshing = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (swRefreshing) return;
+    swRefreshing = true;
+    showUpdateToast();
+  });
+  navigator.serviceWorker.register('sw.js').then(reg => {
+    // Check for updates every 5 minutes while the page is open
+    setInterval(() => reg.update(), 5 * 60 * 1000);
+  }).catch(() => {});
+}
+
+function showUpdateToast() {
+  const t = document.createElement('div');
+  t.style.cssText = 'position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#252526;border:1px solid #569cd6;color:#d4d4d4;font-size:13px;padding:10px 18px;border-radius:10px;z-index:9999;display:flex;align-items:center;gap:12px;box-shadow:0 6px 20px rgba(0,0,0,0.45)';
+  t.innerHTML = '업데이트가 있습니다. <button onclick="location.reload()" style="background:#569cd6;color:#fff;border:none;border-radius:6px;padding:4px 12px;cursor:pointer;font-size:12px">새로고침</button><button onclick="this.parentElement.remove()" style="background:none;border:none;color:#858585;cursor:pointer;font-size:16px;line-height:1;padding:0 2px">×</button>';
+  document.body.appendChild(t);
+}
+</script>
+</body>
+</html>
+"""
+
+
+PDFVIEW_HTML = r"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; background: #404040; overflow: hidden; }
+#scroll { position: absolute; inset: 0; overflow-y: auto; padding: 8px 0; display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.pg-wrap { background: white; box-shadow: 0 2px 10px rgba(0,0,0,0.5); flex-shrink: 0; }
+.pg-wrap canvas { display: block; }
+
+#zoom-bar {
+  position: fixed;
+  bottom: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: rgba(30,30,30,0.88);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 999px;
+  padding: 5px 10px;
+  z-index: 100;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+#zoom-bar.visible, body:hover #zoom-bar { opacity: 1; }
+.z-btn {
+  background: none;
+  border: none;
+  color: #ccc;
+  cursor: pointer;
+  font-size: 15px;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  transition: background 0.13s, color 0.13s;
+}
+.z-btn:hover { background: rgba(255,255,255,0.12); color: #fff; }
+#zoom-label { color: #ccc; font-size: 11px; min-width: 38px; text-align: center; font-family: monospace; }
+</style>
+</head>
+<body>
+<div id="scroll"></div>
+<div id="zoom-bar">
+  <button class="z-btn" id="z-out" title="축소">−</button>
+  <span id="zoom-label">100%</span>
+  <button class="z-btn" id="z-in" title="확대">+</button>
+  <button class="z-btn" id="z-fit" title="너비 맞춤" style="font-size:11px;width:auto;padding:0 6px;border-radius:8px">맞춤</button>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+const pdfPath = new URLSearchParams(location.search).get('path');
+const scroll = document.getElementById('scroll');
+const zoomLabel = document.getElementById('zoom-label');
+let pdfDoc = null;
+let baseScale = 1;     // fit-to-width scale
+let zoomFactor = 1;    // user multiplier on top of baseScale
+let scale = 1;         // baseScale * zoomFactor
+let nativePageWidth = 0;  // first-page native width (pt), for fit recalc
+const visibility = new Map();
+let lastReported = 0;
+let renderSet = new Set();
+
+function currentScale() { return baseScale * zoomFactor; }
+
+function updateZoomLabel() {
+  // Show absolute zoom relative to the PDF's native size
+  zoomLabel.textContent = Math.round(baseScale * zoomFactor * 100) + '%';
+}
+
+function fitToWidth() {
+  if (!nativePageWidth) return;
+  baseScale = Math.max(0.5, scroll.clientWidth / nativePageWidth);
+  zoomFactor = 1;
+  rerender(lastReported || 1);
+}
+
+async function rerender(keepPage) {
+  scale = currentScale();
+  renderSet.clear();
+  scroll.querySelectorAll('.pg-wrap').forEach(wrap => {
+    const page = parseInt(wrap.dataset.page);
+    const vp = { width: baseScale * wrap._nativeWidth * zoomFactor,
+                  height: baseScale * wrap._nativeHeight * zoomFactor };
+    wrap.style.cssText = `width:${vp.width}px;height:${vp.height}px`;
+    wrap.replaceChildren(); // clear canvas, will re-render on intersect
+  });
+  // re-render visible pages
+  visibility.forEach((ratio, page) => {
+    if (ratio > 0) renderPage(page);
+  });
+  if (keepPage) {
+    const wrap = scroll.querySelector(`[data-page="${keepPage}"]`);
+    if (wrap) wrap.scrollIntoView({ block: 'start' });
+  }
+  updateZoomLabel();
+}
+
+function changeZoom(delta) {
+  const steps = [0.5, 0.67, 0.75, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3];
+  const cur = zoomFactor;
+  let idx = steps.findIndex(s => s >= cur - 0.01);
+  if (idx === -1) idx = steps.length - 1;
+  idx = Math.min(Math.max(idx + delta, 0), steps.length - 1);
+  zoomFactor = steps[idx];
+  rerender(lastReported || 1);
+}
+
+document.getElementById('z-out').addEventListener('click', () => changeZoom(-1));
+document.getElementById('z-in').addEventListener('click', () => changeZoom(+1));
+document.getElementById('z-fit').addEventListener('click', fitToWidth);
+
+async function init() {
+  pdfDoc = await pdfjsLib.getDocument('/file?path=' + encodeURIComponent(pdfPath)).promise;
+  const firstPage = await pdfDoc.getPage(1);
+  const nativeVp = firstPage.getViewport({ scale: 1 });
+  nativePageWidth = nativeVp.width;
+  baseScale = Math.max(0.5, scroll.clientWidth / nativePageWidth);
+  scale = currentScale();
+
+  const obs = new IntersectionObserver(onIntersect, { root: scroll, threshold: [0, 0.01, 0.25, 0.5, 0.75, 1] });
+  for (let i = 1; i <= pdfDoc.numPages; i++) {
+    const page = await pdfDoc.getPage(i);
+    const vp = page.getViewport({ scale: 1 });
+    const wrap = document.createElement('div');
+    wrap.className = 'pg-wrap';
+    wrap.dataset.page = i;
+    wrap._nativeWidth = vp.width;
+    wrap._nativeHeight = vp.height;
+    wrap.style.cssText = `width:${vp.width * scale}px;height:${vp.height * scale}px`;
+    scroll.appendChild(wrap);
+    obs.observe(wrap);
+  }
+  renderPage(1); renderPage(2);
+  updateZoomLabel();
+}
+
+function onIntersect(entries) {
+  entries.forEach(e => {
+    const p = parseInt(e.target.dataset.page);
+    visibility.set(p, e.intersectionRatio);
+    if (e.isIntersecting) renderPage(p);
+    if (e.isIntersecting && p < pdfDoc.numPages) renderPage(p + 1);
+  });
+  reportCurrentPage();
+}
+
+function reportCurrentPage() {
+  let best = 0, bestRatio = 0;
+  visibility.forEach((ratio, page) => {
+    if (ratio > bestRatio || (ratio === bestRatio && page < best)) {
+      bestRatio = ratio; best = page;
+    }
+  });
+  if (best > 0 && best !== lastReported) {
+    lastReported = best;
+    window.parent.postMessage({ type: 'pagechange', page: best }, '*');
+  }
+}
+
+async function renderPage(pageNum) {
+  if (pageNum < 1 || pageNum > pdfDoc?.numPages) return;
+  if (renderSet.has(pageNum)) return;
+  renderSet.add(pageNum);
+  const wrap = scroll.querySelector(`[data-page="${pageNum}"]`);
+  if (!wrap) return;
+  const page = await pdfDoc.getPage(pageNum);
+  const dpr = window.devicePixelRatio || 1;
+  const cssScale = currentScale();
+  const vp = page.getViewport({ scale: cssScale * dpr });
+  const canvas = document.createElement('canvas');
+  canvas.width = vp.width;
+  canvas.height = vp.height;
+  canvas.style.width  = (vp.width  / dpr) + 'px';
+  canvas.style.height = (vp.height / dpr) + 'px';
+  wrap.style.cssText = `width:${vp.width / dpr}px;height:${vp.height / dpr}px`;
+  wrap.replaceChildren(canvas);
+  await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
+}
+
+window.addEventListener('message', e => {
+  if (e.data?.type !== 'gotopage') return;
+  const wrap = scroll.querySelector(`[data-page="${e.data.page}"]`);
+  if (wrap) wrap.scrollIntoView({ behavior: 'smooth', block: 'start' });
+});
+
+init().catch(console.error);
+</script>
+</body>
+</html>
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *_):
+        pass
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        qs = parse_qs(parsed.query)
+
+        if path == "/":
+            self._respond(200, "text/html; charset=utf-8", HTML.encode("utf-8"))
+
+        elif path == "/pdfview":
+            self._respond(200, "text/html; charset=utf-8", PDFVIEW_HTML.encode("utf-8"))
+
+        elif path in ("/icon.svg", "/manifest.json", "/sw.js"):
+            file_path = SCRIPT_DIR / path.lstrip("/")
+            if file_path.exists():
+                mime = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+                self._respond(200, mime, file_path.read_bytes())
+            else:
+                self._respond(404, "text/plain; charset=utf-8", b"Not found")
+
+        elif path == "/api/files":
+            data = self._list_files()
+            self._respond(200, "application/json; charset=utf-8", json.dumps(data, ensure_ascii=False).encode("utf-8"))
+
+        elif path == "/file":
+            rel = unquote(qs.get("path", [""])[0])
+            raw = qs.get("raw", ["0"])[0] == "1"
+            file_path = ROOT / rel
+            if not file_path.resolve().is_relative_to(ROOT):
+                self._respond(403, "text/plain; charset=utf-8", b"Forbidden")
+                return
+            if not file_path.exists():
+                self._respond(404, "text/plain; charset=utf-8", b"Not found")
+                return
+            mime = "text/plain; charset=utf-8" if raw else (
+                mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+            )
+            self._respond(200, mime, file_path.read_bytes())
+
+        else:
+            self._respond(404, "text/plain; charset=utf-8", b"Not found")
+
+    def _respond(self, code, mime, body):
+        self.send_response(code)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _list_files(self):
+        groups: dict[str, list] = {}
+        for pdf in sorted(ROOT.glob("**/*.pdf"), key=_natural_key):
+            rel_pdf = str(pdf.relative_to(ROOT))
+            rel_md = str(pdf.with_suffix(".md").relative_to(ROOT))
+            has_notes = pdf.with_suffix(".md").exists()
+            parts = pdf.relative_to(ROOT).parts
+            course = parts[0] if len(parts) > 1 else "."
+            groups.setdefault(course, []).append({
+                "stem": pdf.stem,
+                "pdf": rel_pdf,
+                "md": rel_md,
+                "has_notes": has_notes,
+            })
+        return [{"course": k, "files": v} for k, v in groups.items()]
+
+
+def main():
+    server = HTTPServer(("localhost", 0), Handler)
+    server.allow_reuse_address = True
+    port = server.server_address[1]
+    url = f"http://localhost:{port}"
+    print(f"altToNotes 뷰어 시작: {url}")
+    print(f"루트 디렉토리: {ROOT}")
+    print("종료하려면 Ctrl+C")
+    threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.shutdown()
+        server.server_close()
+        print("\n서버 종료.")
+
+
+if __name__ == "__main__":
+    main()
