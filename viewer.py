@@ -619,7 +619,23 @@ HTML = r"""<!DOCTYPE html>
     color: var(--muted);
     background: rgba(255, 255, 255, 0.02);
   }
-  .empty-note code { margin-top: 8px; }
+  .empty-note p + p {
+    margin-top: 6px;
+    font-size: 13px;
+    color: var(--muted-2);
+  }
+  .empty-note pre {
+    margin-top: 10px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    overflow-x: auto;
+    background: var(--code-inline-bg);
+  }
+  .empty-note code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    color: var(--text);
+  }
 
   /* Light mode for notes pane */
   body.notes-light #notes-scroll { background: #f6f8fa; }
@@ -1513,11 +1529,16 @@ async function openFile(f, item) {
   if (f.has_notes) {
     await renderNotesInto(f, notesPaneEl);
   } else {
-    notesPaneEl.innerHTML = `
+    const filenameEl = document.getElementById('notes-toolbar-filename');
+    if (filenameEl) filenameEl.textContent = f.stem + '.md';
+    const scrollEl = notesPaneEl.querySelector('#notes-scroll');
+    if (scrollEl) scrollEl.innerHTML = `
       <div class="notes-shell">
         <div class="empty-note">
           <p>아직 생성된 노트가 없습니다.</p>
-          <code>python script.py ${f.pdf}</code>
+          <p>아래 명령어로 노트 ID를 확인하고 생성하세요:</p>
+          <pre><code>python script.py --list
+python script.py --note &lt;ID&gt;</code></pre>
         </div>
       </div>
     `;
@@ -1892,7 +1913,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/pdfview":
             self._respond(200, "text/html; charset=utf-8", PDFVIEW_HTML.encode("utf-8"))
 
-        elif path in ("/icon.svg", "/manifest.json", "/sw.js"):
+        elif path in ("/favicon.svg", "/icon.svg", "/manifest.json", "/sw.js"):
             file_path = SCRIPT_DIR / path.lstrip("/")
             if file_path.exists():
                 mime = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"

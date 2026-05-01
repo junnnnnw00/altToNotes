@@ -1,1 +1,47 @@
-[]
+[
+  {
+    "course": "CSED226",
+    "files": [
+      {
+        "stem": "_Data_Analytics__10_2__Univariate_Analysis_Visualization",
+        "pdf": "CSED226/기말/_Data_Analytics__10_2__Univariate_Analysis_Visualization.pdf",
+        "md": "CSED226/기말/_Data_Analytics__10_2__Univariate_Analysis_Visualization.md",
+        "has_notes": true
+      },
+      {
+        "stem": "_Data_Analytics__11_1__Bivariate_Data_Analysis_and_Visualization",
+        "pdf": "CSED226/기말/_Data_Analytics__11_1__Bivariate_Data_Analysis_and_Visualization.pdf",
+        "md": "CSED226/기말/_Data_Analytics__11_1__Bivariate_Data_Analysis_and_Visualization.md",
+        "has_notes": true
+      }
+    ]
+  },
+  {
+    "course": "CSED232",
+    "files": [
+      {
+        "stem": "lecture8",
+        "pdf": "CSED232/기말/lecture8.pdf",
+        "md": "CSED232/기말/lecture8.md",
+        "has_notes": true
+      }
+    ]
+  },
+  {
+    "course": "CSED233",
+    "files": [
+      {
+        "stem": "11_BTree",
+        "pdf": "CSED233/기말/11_BTree.pdf",
+        "md": "CSED233/기말/11_BTree.md",
+        "has_notes": true
+      },
+      {
+        "stem": "12_Dictionary_hashing",
+        "pdf": "CSED233/기말/12_Dictionary_hashing.pdf",
+        "md": "CSED233/기말/12_Dictionary_hashing.md",
+        "has_notes": true
+      }
+    ]
+  }
+]

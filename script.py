@@ -36,7 +36,8 @@ def get_client():
                 _client = genai.Client(api_key=api_key)
     return _client
 
-ALT_DB = Path.home() / "Library/Application Support/alt/data/database/lecture_notes.db"
+_DEFAULT_ALT_DB = Path.home() / "Library/Application Support/alt/data/database/lecture_notes.db"
+ALT_DB = Path(os.environ["ALT_DB_PATH"]) if "ALT_DB_PATH" in os.environ else _DEFAULT_ALT_DB
 ROOT = Path(__file__).parent.resolve()
 
 _mupdf_lock = threading.Lock()
@@ -88,12 +89,13 @@ def resolve_folder_path(folder_id, folders: dict) -> Path:
     return Path(*reversed(parts))
 
 
-def read_alt_notes() -> list[dict]:
-    if not ALT_DB.exists():
-        raise FileNotFoundError(f"Alt DB를 찾을 수 없습니다: {ALT_DB}\nAlt(altalt.io)가 설치되어 있는지 확인하세요.")
+def read_alt_notes(db_path: Path | None = None) -> list[dict]:
+    path = db_path or ALT_DB
+    if not path.exists():
+        raise FileNotFoundError(f"Alt DB를 찾을 수 없습니다: {path}\nAlt(altalt.io)가 설치되어 있는지 확인하세요.\n다른 경로라면 --alt-db 옵션 또는 ALT_DB_PATH 환경변수를 사용하세요.")
 
     try:
-        conn = sqlite3.connect(f"file:{ALT_DB}?mode=ro", uri=True)
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     except sqlite3.OperationalError as e:
         raise RuntimeError(f"Alt DB 연결 실패: {e}") from e
 
@@ -422,11 +424,13 @@ def main():
     parser.add_argument("--workers", "-j", type=int, default=1, metavar="N", help="병렬 처리 워커 수 (기본값: 1)")
     parser.add_argument("--show-mupdf-messages", action="store_true", help="MuPDF 내부 경고를 콘솔에 표시")
     parser.add_argument("--save-warning-log", action="store_true", help="MuPDF 경고를 .mupdf_warnings.log 파일로 저장")
+    parser.add_argument("--alt-db", metavar="PATH", help="Alt DB 경로 직접 지정 (기본값: ~/Library/Application Support/alt/data/database/lecture_notes.db)")
 
     args = parser.parse_args()
     configure_pymupdf(show_messages=args.show_mupdf_messages)
 
-    notes = read_alt_notes()
+    db_path = Path(args.alt_db) if args.alt_db else None
+    notes = read_alt_notes(db_path)
 
     if args.list or (not args.note and not args.all):
         cmd_list(notes)
