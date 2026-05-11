@@ -3,6 +3,7 @@
 [Alt(altalt.io)](https://altalt.io) 음성 노트, Alt 공유 링크, 일반 PDF를 Gemini 2.5 Flash로 페이지별 자동 해설하고, PDF와 노트를 나란히 볼 수 있는 뷰어입니다.
 
 > **autonotes**([junnnnnw00/autonotes](https://github.com/junnnnnw00/autonotes))를 기반으로, Alt의 강의 음성 전사 데이터를 함께 활용하여 더 풍부한 해설 노트를 생성합니다.
+
 > **🌐 웹 뷰어**: [altToNotes](https://github.com/junnnnnw00/altToNotes)
 
 ---
