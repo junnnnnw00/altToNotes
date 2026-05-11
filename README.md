@@ -4,7 +4,7 @@
 
 > **autonotes**([junnnnnw00/autonotes](https://github.com/junnnnnw00/autonotes))를 기반으로, Alt의 강의 음성 전사 데이터를 함께 활용하여 더 풍부한 해설 노트를 생성합니다.
 
-> **🌐 웹 뷰어**: [https://junnnnwoo.github.com/altToNotes](https://junnnnwoo.github.com/altToNotes)
+> **🌐 웹 뷰어**: [https://junnnnwoo.github.io/altToNotes](https://junnnnwoo.github.io/altToNotes)
 
 ---
 
