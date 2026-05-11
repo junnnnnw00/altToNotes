@@ -228,14 +228,26 @@ def build_prompt(course_context: str, slide_transcript: str) -> str:
 
 # ── Slide processing ───────────────────────────────────────────────────────────
 
+SLIDE_HEADER_RE = re.compile(r"^## Slide (\d+)\n", re.MULTILINE)
+
+
+def normalize_generated_markdown(md_text: str) -> str:
+    normalized = md_text.replace("\r\n", "\n")
+    # Recover malformed boundaries like `---## Slide 2`.
+    normalized = re.sub(r"---[ \t]*(?=## Slide \d+\b)", "---\n\n", normalized)
+    return normalized
+
+
 def _parse_md_sections(md_text: str) -> tuple[str, dict[int, str]]:
-    parts = re.split(r"\n(?=## Slide \d+\n)", md_text)
-    header = parts[0] + "\n"
+    normalized = normalize_generated_markdown(md_text)
+    first_slide = SLIDE_HEADER_RE.search(normalized)
+    if not first_slide:
+        return normalized.rstrip() + "\n", {}
+
+    header = normalized[:first_slide.start()].rstrip() + "\n\n"
     sections: dict[int, str] = {}
-    for part in parts[1:]:
-        m = re.match(r"## Slide (\d+)\n", part)
-        if m:
-            sections[int(m.group(1))] = part
+    for match in re.finditer(r"(?ms)^## Slide (\d+)\n.*?(?=^## Slide \d+\n|\Z)", normalized):
+        sections[int(match.group(1))] = match.group(0).rstrip() + "\n\n"
     return header, sections
 
 
@@ -354,6 +366,7 @@ def explain_pdf(
                 prompt = build_prompt(course_context, slide_transcripts[page_num])
                 full_notes += _process_slide(doc.load_page(page_num), prompt, page_num + 1, delay, warning_logs)
 
+    full_notes = normalize_generated_markdown(full_notes).rstrip() + "\n"
     output_md.parent.mkdir(parents=True, exist_ok=True)
     output_md.write_text(full_notes, encoding="utf-8")
     print(f"{tag} 완료 -> [{output_md}]")
