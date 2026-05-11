@@ -3,16 +3,21 @@ import os
 os.environ.setdefault("PYMUPDF_MESSAGE", f"path:{os.devnull}")
 
 import argparse
+import datetime as dt
+import hashlib
 import io
 import json
 import re
 import shutil
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 import fitz  # PyMuPDF
 from google import genai
@@ -39,6 +44,10 @@ def get_client():
 _DEFAULT_ALT_DB = Path.home() / "Library/Application Support/alt/data/database/lecture_notes.db"
 ALT_DB = Path(os.environ["ALT_DB_PATH"]) if "ALT_DB_PATH" in os.environ else _DEFAULT_ALT_DB
 ROOT = Path(__file__).parent.resolve()
+HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; altToNotes/1.0; +https://github.com/junnnnnw00/altToNotes)",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 _mupdf_lock = threading.Lock()
 
@@ -73,6 +82,160 @@ COURSE_CONTEXTS = {
     "CSED441": "이 슬라이드는 컴퓨터비전 개론 (CSED441) 강의 자료입니다. 이미지 처리, 에지 검출, 특징 추출, CNN 기반 인식, 객체 탐지, 세그멘테이션 등이 주로 다뤄집니다.",
     "CSED451": "이 슬라이드는 컴퓨터그래픽스 (CSED451) 강의 자료입니다. 렌더링 파이프라인, 래스터화, 광선 추적, 변환 행렬, 셰이더, OpenGL/WebGL 등이 주로 다뤄집니다.",
 }
+
+
+# ── Shared helpers ─────────────────────────────────────────────────────────────
+
+NEXT_F_CHUNK_RE = re.compile(r'self\.__next_f\.push\(\[1,"(.*?)"\]\)</script>', re.DOTALL)
+
+
+def is_url(value: str) -> bool:
+    return urlparse(value).scheme in {"http", "https"}
+
+
+def sanitize_path_part(value: str, fallback: str = "untitled") -> str:
+    sanitized = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", value).strip().strip(".")
+    return sanitized[:120] or fallback
+
+
+def iso_date_from_timestamp(value: str | None) -> str:
+    if not value:
+        return dt.date.today().isoformat()
+    try:
+        return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).date().isoformat()
+    except ValueError:
+        return value.split("T", 1)[0]
+
+
+def fetch_url_text(url: str) -> tuple[str, str]:
+    req = Request(url, headers=HTTP_HEADERS)
+    with urlopen(req, timeout=30) as resp:
+        charset = resp.headers.get_content_charset() or "utf-8"
+        return resp.read().decode(charset, errors="replace"), resp.geturl()
+
+
+def download_url_to_file(url: str, dest: Path):
+    req = Request(url, headers=HTTP_HEADERS)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with urlopen(req, timeout=60) as resp, dest.open("wb") as f:
+        shutil.copyfileobj(resp, f)
+
+
+def decode_next_f_chunks(html: str) -> list[str]:
+    chunks: list[str] = []
+    for raw in NEXT_F_CHUNK_RE.findall(html):
+        try:
+            chunks.append(json.loads(f'"{raw}"'))
+        except json.JSONDecodeError:
+            continue
+    return chunks
+
+
+def resolve_next_f_text(chunks: list[str], ref: str | None) -> str | None:
+    if not ref:
+        return None
+    normalized = ref[1:] if ref.startswith("$") else ref
+    marker = f"{normalized}:T"
+    for idx, chunk in enumerate(chunks[:-1]):
+        if chunk.startswith(marker):
+            return chunks[idx + 1]
+    return None
+
+
+def parse_shared_note_page(html: str) -> dict:
+    chunks = decode_next_f_chunks(html)
+    meta_chunk = next(
+        (
+            chunk for chunk in chunks
+            if '"noteTitle":"' in chunk and '"components":{' in chunk and '"slides_url":"' in chunk
+        ),
+        None,
+    )
+    if meta_chunk is None:
+        raise ValueError("공유 노트 페이지에서 메타데이터를 찾을 수 없습니다.")
+
+    try:
+        payload = json.loads(meta_chunk.split(":", 1)[1])
+        data = payload[3]["data"]
+        components = data["components"]
+    except (IndexError, KeyError, TypeError, json.JSONDecodeError) as e:
+        raise ValueError("공유 노트 메타데이터를 해석하지 못했습니다.") from e
+
+    return {
+        "title": data.get("noteTitle") or "shared_alt_note",
+        "date": iso_date_from_timestamp(data.get("createdAt")),
+        "slides_url": components.get("slides_url"),
+        "summary": resolve_next_f_text(chunks, components.get("summary")),
+        "transcript": resolve_next_f_text(chunks, components.get("transcript")),
+    }
+
+
+def default_folder_for_pdf(source_path: Path) -> Path:
+    try:
+        rel = source_path.resolve().relative_to(ROOT)
+    except ValueError:
+        return Path("Imported PDFs")
+    return rel.parent if rel.parent != Path(".") else Path("Imported PDFs")
+
+
+def build_shared_alt_note(share_url: str, download_dir: Path, output_folder: Path | None = None) -> dict:
+    html, final_url = fetch_url_text(share_url)
+    shared = parse_shared_note_page(html)
+
+    slides_url = shared.get("slides_url")
+    if not isinstance(slides_url, str) or not slides_url:
+        raise ValueError(f"공유 링크에서 슬라이드 PDF URL을 찾지 못했습니다: {final_url}")
+
+    title = str(shared["title"])
+    output_stem = sanitize_path_part(title, "shared_alt_note")
+    token = final_url.rstrip("/").split("/")[-1]
+    cache_name = f"{output_stem}-{hashlib.sha1(token.encode('utf-8')).hexdigest()[:8]}.pdf"
+    cached_pdf = download_dir / cache_name
+    download_url_to_file(slides_url, cached_pdf)
+
+    return {
+        "id": f"share:{token}",
+        "title": title,
+        "date": shared["date"],
+        "folder_path": output_folder or Path("Shared Alt"),
+        "slide_path": cached_pdf,
+        "output_stem": output_stem,
+        "summary": shared.get("summary"),
+        "transcript": shared.get("transcript"),
+    }
+
+
+def build_pdf_note(pdf_input: str, download_dir: Path, output_folder: Path | None = None) -> dict:
+    today = dt.date.today().isoformat()
+
+    if is_url(pdf_input):
+        parsed = urlparse(pdf_input)
+        stem = Path(parsed.path).stem or "imported_pdf"
+        output_stem = sanitize_path_part(stem, "imported_pdf")
+        cache_name = f"{output_stem}-{hashlib.sha1(pdf_input.encode('utf-8')).hexdigest()[:8]}.pdf"
+        cached_pdf = download_dir / cache_name
+        download_url_to_file(pdf_input, cached_pdf)
+        folder_path = output_folder or Path("Imported PDFs")
+        title = output_stem
+        slide_path = cached_pdf
+    else:
+        slide_path = Path(pdf_input).expanduser().resolve()
+        if not slide_path.exists():
+            raise FileNotFoundError(f"PDF를 찾을 수 없습니다: {slide_path}")
+        output_stem = sanitize_path_part(slide_path.stem, "imported_pdf")
+        folder_path = output_folder or default_folder_for_pdf(slide_path)
+        title = slide_path.stem
+
+    return {
+        "id": f"pdf:{slide_path}",
+        "title": title,
+        "date": today,
+        "folder_path": folder_path,
+        "slide_path": slide_path,
+        "output_stem": output_stem,
+        "summary": None,
+        "transcript": None,
+    }
 
 
 # ── Alt DB reading ─────────────────────────────────────────────────────────────
@@ -196,21 +359,26 @@ def get_course_context(folder_path: Path) -> str:
     return "이 슬라이드는 대학교 전공 강의 자료입니다."
 
 
-def build_prompt(course_context: str, slide_transcript: str) -> str:
+def build_prompt(course_context: str, slide_transcript: str, note_summary: str = "") -> str:
+    has_summary = bool(note_summary.strip())
     has_transcript = bool(slide_transcript.strip())
-    transcript_section = (
-        f"\n[강의 음성 전사 — 이 슬라이드 구간]\n{slide_transcript}\n"
-        if has_transcript else ""
-    )
+
+    context_sections = []
+    if has_summary:
+        context_sections.append(f"[강의 전체 요약]\n{note_summary}")
+    if has_transcript:
+        context_sections.append(f"[강의 음성 전사 — 이 슬라이드 구간]\n{slide_transcript}")
+
+    extra_context = f"\n{'\n\n'.join(context_sections)}\n" if context_sections else ""
     lecture_note_item = (
-        "- **강의 내용**: 교수님이 음성으로 강조하신 내용이나 추가 설명을 포함\n"
-        if has_transcript else ""
+        "- **강의 맥락**: 제공된 요약/전사에서 드러나는 교수 설명, 전체 흐름, 강조 포인트를 반영\n"
+        if context_sections else ""
     )
-    slide_ref = "와 위의 강의 음성 전사" if has_transcript else ""
+    slide_ref = "와 제공된 강의 맥락" if context_sections else ""
 
     return f"""당신은 POSTECH 전공 튜터입니다.
 {course_context}
-{transcript_section}
+{extra_context}
 첨부된 슬라이드 이미지{slide_ref}를 분석하여 다음 형식으로 마크다운 노트를 작성해 주세요:
 - **핵심 개념**: 슬라이드의 주요 개념을 명확하게 설명
 - **코드/수식 해설**: 코드는 코드 블록(```)을, 수식은 LaTeX($ 또는 $$)을 사용
@@ -313,17 +481,24 @@ def explain_pdf(
     label: str = "",
 ):
     pdf_path = note["slide_path"]
+    note_name = note.get("output_stem") or pdf_path.stem
     tag = f"[{label or pdf_path.name}]"
     print(f"\n{tag} 분석을 시작합니다... ({pdf_path.name})")
 
     has_transcript = bool(note.get("transcript"))
+    has_summary = bool(note.get("summary"))
     if has_transcript:
         print(f"{tag} 음성 전사 데이터 포함 ({len(note['transcript'])} chars)")
+    if has_summary:
+        print(f"{tag} 요약 데이터 포함 ({len(note['summary'])} chars)")
+    if not has_transcript and not has_summary:
+        print(f"{tag} 음성 전사/요약 없음 — 슬라이드만으로 생성합니다.")
     else:
-        print(f"{tag} 음성 전사 없음 — 슬라이드만으로 생성합니다.")
+        print(f"{tag} 슬라이드와 추가 맥락을 함께 사용합니다.")
 
     warning_logs: list[str] = []
     course_context = get_course_context(note["folder_path"])
+    note_summary = note.get("summary") or ""
 
     segments = parse_transcript_segments(note["transcript"]) if has_transcript else []
 
@@ -345,7 +520,7 @@ def explain_pdf(
                     continue
 
                 print(f"{tag} -> 슬라이드 {num}/{num_pages} 재처리 중...")
-                prompt = build_prompt(course_context, slide_transcripts[num - 1])
+                prompt = build_prompt(course_context, slide_transcripts[num - 1], note_summary)
                 sections[num] = _process_slide(doc.load_page(num - 1), prompt, num, delay, warning_logs)
 
             full_notes = header + "".join(sections[n] for n in sorted(sections))
@@ -355,15 +530,17 @@ def explain_pdf(
                 note["folder_path"].parts[0] if note["folder_path"].parts else "강의",
             )
             transcript_label = " (음성 전사 포함)" if has_transcript else ""
-            full_notes = f"# {course_code} - {pdf_path.stem} 상세 해설 노트{transcript_label}\n\n"
+            full_notes = f"# {course_code} - {note_name} 상세 해설 노트{transcript_label}\n\n"
             full_notes += f"> 이 노트는 Gemini 2.5 Flash를 이용해 자동 생성되었습니다."
             if has_transcript:
                 full_notes += " Alt(altalt.io) 음성 전사 데이터를 함께 활용했습니다."
+            elif has_summary:
+                full_notes += " 공유된 강의 요약을 참고했습니다."
             full_notes += "\n\n---\n\n"
 
             for page_num in range(num_pages):
                 print(f"{tag} -> 슬라이드 {page_num + 1}/{num_pages} 처리 중...")
-                prompt = build_prompt(course_context, slide_transcripts[page_num])
+                prompt = build_prompt(course_context, slide_transcripts[page_num], note_summary)
                 full_notes += _process_slide(doc.load_page(page_num), prompt, page_num + 1, delay, warning_logs)
 
     full_notes = normalize_generated_markdown(full_notes).rstrip() + "\n"
@@ -381,7 +558,7 @@ def explain_pdf(
 
 def get_output_paths(note: dict, output_root: Path = ROOT) -> tuple[Path, Path]:
     """(output_pdf_path, output_md_path) 반환."""
-    stem = note["slide_path"].stem
+    stem = note.get("output_stem") or note["slide_path"].stem
     out_dir = output_root / note["folder_path"]
     return out_dir / f"{stem}.pdf", out_dir / f"{stem}.md"
 
@@ -391,7 +568,11 @@ def ensure_pdf_copied(note: dict, output_pdf: Path):
     if not output_pdf.exists():
         output_pdf.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(note["slide_path"], output_pdf)
-        print(f"  PDF 복사: {output_pdf.relative_to(ROOT)}")
+        try:
+            display_path = output_pdf.relative_to(ROOT)
+        except ValueError:
+            display_path = output_pdf
+        print(f"  PDF 복사: {display_path}")
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -423,6 +604,8 @@ def main():
   python script.py --note 1                      # 노트 ID 1 처리
   python script.py --note 1,2,3                  # 여러 노트 처리
   python script.py --all                         # 모든 노트 처리
+  python script.py --share-link https://altalt.io/note/...   # Alt 공유 링크 처리
+  python script.py --pdf ./slides.pdf            # 일반 PDF 처리
   python script.py --note 1 --retry              # 오류 슬라이드 재처리
   python script.py --note 1 --slides 3,7         # 특정 슬라이드만 처리
   python script.py --all -j 2                    # 병렬 처리
@@ -431,6 +614,9 @@ def main():
     parser.add_argument("--list", action="store_true", help="처리 가능한 Alt 노트 목록 출력")
     parser.add_argument("--note", help="처리할 노트 ID (쉼표 구분, 예: 1,2,3)")
     parser.add_argument("--all", action="store_true", help="슬라이드가 있는 모든 노트 처리")
+    parser.add_argument("--share-link", action="append", metavar="URL", help="Alt 공유 링크 직접 처리 (반복 사용 가능)")
+    parser.add_argument("--pdf", action="append", metavar="PATH_OR_URL", help="일반 PDF 파일 또는 URL 직접 처리 (반복 사용 가능)")
+    parser.add_argument("--output-folder", metavar="PATH", help="share-link/pdf 입력의 출력 폴더 (예: CSED232/기말)")
     parser.add_argument("--delay", type=float, default=2.0, help="슬라이드 처리 간 대기 시간(초), 기본값: 2.0")
     parser.add_argument("--retry", action="store_true", help="오류가 발생한 슬라이드만 재처리")
     parser.add_argument("--slides", help="재처리할 슬라이드 번호 (쉼표 구분, 예: 3,7,12)")
@@ -442,86 +628,102 @@ def main():
     args = parser.parse_args()
     configure_pymupdf(show_messages=args.show_mupdf_messages)
 
-    db_path = Path(args.alt_db) if args.alt_db else None
-    notes = read_alt_notes(db_path)
+    import_mode = bool(args.share_link or args.pdf)
+    if import_mode and (args.list or args.note or args.all or args.alt_db):
+        parser.error("--share-link/--pdf는 --list, --note, --all, --alt-db와 함께 사용할 수 없습니다.")
 
-    if args.list or (not args.note and not args.all):
-        cmd_list(notes)
-        return
+    selected: list[dict]
+    output_folder = Path(args.output_folder) if args.output_folder else None
 
-    # Select notes to process
-    notes_by_id = {n["id"]: n for n in notes}
-    if args.all:
-        selected = notes
-    else:
-        try:
-            ids = [int(x.strip()) for x in args.note.split(",")]
-        except ValueError:
-            print("[오류] --note 인자는 쉼표로 구분된 숫자여야 합니다. 예: 1,2,3")
-            sys.exit(1)
-        selected = []
-        for nid in ids:
-            if nid not in notes_by_id:
-                print(f"[경고] 노트 ID {nid}를 찾을 수 없습니다. 건너뜁니다.")
-            else:
-                selected.append(notes_by_id[nid])
+    with tempfile.TemporaryDirectory(prefix="alttonotes-") as temp_dir_str:
+        temp_dir = Path(temp_dir_str)
 
-    if not selected:
-        print("처리할 노트가 없습니다.")
-        sys.exit(1)
+        if import_mode:
+            selected = []
+            for share_url in args.share_link or []:
+                selected.append(build_shared_alt_note(share_url, temp_dir / "shared", output_folder))
+            for pdf_input in args.pdf or []:
+                selected.append(build_pdf_note(pdf_input, temp_dir / "pdfs", output_folder))
+        else:
+            db_path = Path(args.alt_db) if args.alt_db else None
+            notes = read_alt_notes(db_path)
 
-    manual_slides: set[int] = set()
-    if args.slides:
-        try:
-            manual_slides = {int(s.strip()) for s in args.slides.split(",")}
-        except ValueError:
-            print("[오류] --slides 인자는 쉼표로 구분된 숫자여야 합니다. 예: 3,7,12")
-            sys.exit(1)
-
-    workers = min(args.workers, len(selected))
-    print(f"총 {len(selected)}개 노트를 처리합니다." + (f" (워커 {workers}개 병렬)" if workers > 1 else ""))
-
-    def process_one(idx_note):
-        idx, note = idx_note
-        label = f"{idx}/{len(selected)} {note['slide_path'].stem}"
-        output_pdf, output_md = get_output_paths(note)
-
-        ensure_pdf_copied(note, output_pdf)
-
-        target_slides: set[int] | None = None
-        if args.retry or manual_slides:
-            target_slides = manual_slides.copy()
-            if args.retry:
-                failed = find_failed_slides(output_md)
-                if failed:
-                    print(f"[{label}] 오류 슬라이드 감지: {sorted(failed)}")
-                target_slides |= failed
-            if not target_slides:
-                print(f"[{label}] 재처리할 슬라이드 없음, 건너뜁니다.")
+            if args.list or (not args.note and not args.all):
+                cmd_list(notes)
                 return
 
-        explain_pdf(
-            note=note,
-            output_md=output_md,
-            delay=args.delay,
-            target_slides=target_slides,
-            save_warning_log=args.save_warning_log,
-            label=label,
-        )
+            notes_by_id = {n["id"]: n for n in notes}
+            if args.all:
+                selected = notes
+            else:
+                try:
+                    ids = [int(x.strip()) for x in args.note.split(",")]
+                except ValueError:
+                    print("[오류] --note 인자는 쉼표로 구분된 숫자여야 합니다. 예: 1,2,3")
+                    sys.exit(1)
+                selected = []
+                for nid in ids:
+                    if nid not in notes_by_id:
+                        print(f"[경고] 노트 ID {nid}를 찾을 수 없습니다. 건너뜁니다.")
+                    else:
+                        selected.append(notes_by_id[nid])
 
-    if workers <= 1:
-        for item in enumerate(selected, 1):
-            process_one(item)
-    else:
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(process_one, item): item for item in enumerate(selected, 1)}
-            for future in as_completed(futures):
-                exc = future.exception()
-                if exc:
-                    _, note = futures[future]
-                    print(f"[오류] {note['title']}: {exc}")
+        if not selected:
+            print("처리할 노트가 없습니다.")
+            sys.exit(1)
 
-    print("\n모든 작업이 완료되었습니다!")
+        manual_slides: set[int] = set()
+        if args.slides:
+            try:
+                manual_slides = {int(s.strip()) for s in args.slides.split(",")}
+            except ValueError:
+                print("[오류] --slides 인자는 쉼표로 구분된 숫자여야 합니다. 예: 3,7,12")
+                sys.exit(1)
+
+        workers = min(args.workers, len(selected))
+        print(f"총 {len(selected)}개 노트를 처리합니다." + (f" (워커 {workers}개 병렬)" if workers > 1 else ""))
+
+        def process_one(idx_note):
+            idx, note = idx_note
+            label = f"{idx}/{len(selected)} {note.get('output_stem') or note['slide_path'].stem}"
+            output_pdf, output_md = get_output_paths(note)
+
+            ensure_pdf_copied(note, output_pdf)
+
+            target_slides: set[int] | None = None
+            if args.retry or manual_slides:
+                target_slides = manual_slides.copy()
+                if args.retry:
+                    failed = find_failed_slides(output_md)
+                    if failed:
+                        print(f"[{label}] 오류 슬라이드 감지: {sorted(failed)}")
+                    target_slides |= failed
+                if not target_slides:
+                    print(f"[{label}] 재처리할 슬라이드 없음, 건너뜁니다.")
+                    return
+
+            explain_pdf(
+                note=note,
+                output_md=output_md,
+                delay=args.delay,
+                target_slides=target_slides,
+                save_warning_log=args.save_warning_log,
+                label=label,
+            )
+
+        if workers <= 1:
+            for item in enumerate(selected, 1):
+                process_one(item)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(process_one, item): item for item in enumerate(selected, 1)}
+                for future in as_completed(futures):
+                    exc = future.exception()
+                    if exc:
+                        _, note = futures[future]
+                        print(f"[오류] {note['title']}: {exc}")
+
+        print("\n모든 작업이 완료되었습니다!")
 
 
 if __name__ == "__main__":
