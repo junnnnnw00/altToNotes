@@ -328,26 +328,8 @@ def parse_transcript_segments(content_text) -> list[dict]:
     return segments
 
 
-def align_transcript_to_slides(segments: list[dict], num_pages: int) -> list[str]:
-    if not segments or num_pages == 0:
-        return [""] * num_pages
-
-    total_duration = max(s["end"] for s in segments)
-    if total_duration == 0:
-        return [""] * num_pages
-
-    time_per_slide = total_duration / num_pages
-    slide_texts = []
-    for page in range(1, num_pages + 1):
-        start_ms = (page - 1) * time_per_slide
-        end_ms = page * time_per_slide
-        is_last = page == num_pages
-        page_segs = [
-            s["text"] for s in segments
-            if start_ms <= s["start"] and (is_last or s["start"] < end_ms)
-        ]
-        slide_texts.append(" ".join(page_segs))
-    return slide_texts
+def get_full_transcript(segments: list[dict]) -> str:
+    return " ".join(s["text"] for s in segments)
 
 
 # ── Prompt building ────────────────────────────────────────────────────────────
@@ -359,19 +341,19 @@ def get_course_context(folder_path: Path) -> str:
     return "이 슬라이드는 대학교 전공 강의 자료입니다."
 
 
-def build_prompt(course_context: str, slide_transcript: str, note_summary: str = "") -> str:
+def build_prompt(course_context: str, full_transcript: str, note_summary: str = "") -> str:
     has_summary = bool(note_summary.strip())
-    has_transcript = bool(slide_transcript.strip())
+    has_transcript = bool(full_transcript.strip())
 
     context_sections = []
     if has_summary:
         context_sections.append(f"[강의 전체 요약]\n{note_summary}")
     if has_transcript:
-        context_sections.append(f"[강의 음성 전사 — 이 슬라이드 구간]\n{slide_transcript}")
+        context_sections.append(f"[전체 강의 음성 전사]\n{full_transcript}")
 
     extra_context = f"\n{'\n\n'.join(context_sections)}\n" if context_sections else ""
     lecture_note_item = (
-        "- **강의 맥락**: 제공된 요약/전사에서 드러나는 교수 설명, 전체 흐름, 강조 포인트를 반영\n"
+        "- **강의 맥락**: 전체 음성 전사에서 **현재 슬라이드의 내용과 일치하는 구간**을 찾아, 교수님의 실제 설명과 강조 포인트를 반영하세요. 슬라이드와 무관한 음성 전사 내용은 절대 포함하지 마세요.\n"
         if context_sections else ""
     )
     slide_ref = "와 제공된 강의 맥락" if context_sections else ""
@@ -380,16 +362,17 @@ def build_prompt(course_context: str, slide_transcript: str, note_summary: str =
 {course_context}
 {extra_context}
 첨부된 슬라이드 이미지{slide_ref}를 분석하여 다음 형식으로 마크다운 노트를 작성해 주세요:
-- **핵심 개념**: 슬라이드의 주요 개념을 명확하게 설명
+- **핵심 개념**: 슬라이드의 주요 개념을 명확하고 간결하게 설명
 - **코드/수식 해설**: 코드는 코드 블록(```)을, 수식은 LaTeX($ 또는 $$)을 사용
-- **구체적 예시**: 실제 동작 예시나 실생활 비유를 통해 이해를 도움
+- **구체적 예시**: 슬라이드 이해에 꼭 필요한 경우에만 예시를 들고, 너무 길어지지 않게 간결히 작성
 {lecture_note_item}- **시험 포인트**: 시험에 나올 만한 핵심 내용을 ⭐ 표시와 함께 강조
 
-**[수식 작성 규칙 — 반드시 준수]**
-1. 수식은 항상 `$...$`(인라인) 또는 `$$...$$`(블록)으로만 표기하세요.
-2. 백틱(`) 코드 스팬 안에 수식 기호를 절대 넣지 마세요.
-3. 수식을 코드 블록(```) 안에 넣지 마세요.
-4. 수학 변수·기호는 `$...$` 수식으로 표기하세요.
+**[작성 시 주의사항 — 반드시 준수]**
+1. **분량 조절**: 슬라이드에 내용이 적으면(예: 제목 슬라이드, 간단한 다이어그램 등) 쓸데없이 긴 부가 설명이나 억지스러운 코드 예시를 넣지 말고 아주 간결하게 핵심만 작성하세요.
+2. 수식은 항상 `$...$`(인라인) 또는 `$$...$$`(블록)으로만 표기하세요.
+3. 백틱(`) 코드 스팬 안에 수식 기호를 절대 넣지 마세요.
+4. 수식을 코드 블록(```) 안에 넣지 마세요.
+5. 수학 변수·기호는 `$...$` 수식으로 표기하세요.
 
 불필요한 인사말 없이 바로 본론만 작성해 주세요."""
 
@@ -501,10 +484,10 @@ def explain_pdf(
     note_summary = note.get("summary") or ""
 
     segments = parse_transcript_segments(note["transcript"]) if has_transcript else []
+    full_transcript = get_full_transcript(segments) if segments else ""
 
     with fitz.open(str(pdf_path)) as doc:
         num_pages = len(doc)
-        slide_transcripts = align_transcript_to_slides(segments, num_pages) if segments else [""] * num_pages
 
         if target_slides:
             if not output_md.exists():
@@ -520,7 +503,7 @@ def explain_pdf(
                     continue
 
                 print(f"{tag} -> 슬라이드 {num}/{num_pages} 재처리 중...")
-                prompt = build_prompt(course_context, slide_transcripts[num - 1], note_summary)
+                prompt = build_prompt(course_context, full_transcript, note_summary)
                 sections[num] = _process_slide(doc.load_page(num - 1), prompt, num, delay, warning_logs)
 
             full_notes = header + "".join(sections[n] for n in sorted(sections))
@@ -540,7 +523,7 @@ def explain_pdf(
 
             for page_num in range(num_pages):
                 print(f"{tag} -> 슬라이드 {page_num + 1}/{num_pages} 처리 중...")
-                prompt = build_prompt(course_context, slide_transcripts[page_num], note_summary)
+                prompt = build_prompt(course_context, full_transcript, note_summary)
                 full_notes += _process_slide(doc.load_page(page_num), prompt, page_num + 1, delay, warning_logs)
 
     full_notes = normalize_generated_markdown(full_notes).rstrip() + "\n"
