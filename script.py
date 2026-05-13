@@ -20,15 +20,16 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 import fitz  # PyMuPDF
+from dotenv import load_dotenv
 from google import genai
 from PIL import Image
-from dotenv import load_dotenv
 
 load_dotenv()
-MODEL_ID = "gemini-2.5-flash"
+MODEL_ID = "gemini-3-flash-preview"
 
 _client = None
 _client_lock = threading.Lock()
+
 
 def get_client():
     global _client
@@ -37,12 +38,19 @@ def get_client():
             if _client is None:
                 api_key = os.getenv("GEMINI_API_KEY")
                 if not api_key:
-                    raise ValueError("API 키를 찾을 수 없습니다. .env 파일에 GEMINI_API_KEY를 설정해 주세요.")
+                    raise ValueError(
+                        "API 키를 찾을 수 없습니다. .env 파일에 GEMINI_API_KEY를 설정해 주세요."
+                    )
                 _client = genai.Client(api_key=api_key)
     return _client
 
-_DEFAULT_ALT_DB = Path.home() / "Library/Application Support/alt/data/database/lecture_notes.db"
-ALT_DB = Path(os.environ["ALT_DB_PATH"]) if "ALT_DB_PATH" in os.environ else _DEFAULT_ALT_DB
+
+_DEFAULT_ALT_DB = (
+    Path.home() / "Library/Application Support/alt/data/database/lecture_notes.db"
+)
+ALT_DB = (
+    Path(os.environ["ALT_DB_PATH"]) if "ALT_DB_PATH" in os.environ else _DEFAULT_ALT_DB
+)
 ROOT = Path(__file__).parent.resolve()
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; altToNotes/1.0; +https://github.com/junnnnnw00/altToNotes)",
@@ -86,7 +94,9 @@ COURSE_CONTEXTS = {
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
 
-NEXT_F_CHUNK_RE = re.compile(r'self\.__next_f\.push\(\[1,"(.*?)"\]\)</script>', re.DOTALL)
+NEXT_F_CHUNK_RE = re.compile(
+    r'self\.__next_f\.push\(\[1,"(.*?)"\]\)</script>', re.DOTALL
+)
 
 
 def is_url(value: str) -> bool:
@@ -102,7 +112,9 @@ def iso_date_from_timestamp(value: str | None) -> str:
     if not value:
         return dt.date.today().isoformat()
     try:
-        return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).date().isoformat()
+        return (
+            dt.datetime.fromisoformat(value.replace("Z", "+00:00")).date().isoformat()
+        )
     except ValueError:
         return value.split("T", 1)[0]
 
@@ -146,8 +158,11 @@ def parse_shared_note_page(html: str) -> dict:
     chunks = decode_next_f_chunks(html)
     meta_chunk = next(
         (
-            chunk for chunk in chunks
-            if '"noteTitle":"' in chunk and '"components":{' in chunk and '"slides_url":"' in chunk
+            chunk
+            for chunk in chunks
+            if '"noteTitle":"' in chunk
+            and '"components":{' in chunk
+            and '"slides_url":"' in chunk
         ),
         None,
     )
@@ -178,18 +193,24 @@ def default_folder_for_pdf(source_path: Path) -> Path:
     return rel.parent if rel.parent != Path(".") else Path("Imported PDFs")
 
 
-def build_shared_alt_note(share_url: str, download_dir: Path, output_folder: Path | None = None) -> dict:
+def build_shared_alt_note(
+    share_url: str, download_dir: Path, output_folder: Path | None = None
+) -> dict:
     html, final_url = fetch_url_text(share_url)
     shared = parse_shared_note_page(html)
 
     slides_url = shared.get("slides_url")
     if not isinstance(slides_url, str) or not slides_url:
-        raise ValueError(f"공유 링크에서 슬라이드 PDF URL을 찾지 못했습니다: {final_url}")
+        raise ValueError(
+            f"공유 링크에서 슬라이드 PDF URL을 찾지 못했습니다: {final_url}"
+        )
 
     title = str(shared["title"])
     output_stem = sanitize_path_part(title, "shared_alt_note")
     token = final_url.rstrip("/").split("/")[-1]
-    cache_name = f"{output_stem}-{hashlib.sha1(token.encode('utf-8')).hexdigest()[:8]}.pdf"
+    cache_name = (
+        f"{output_stem}-{hashlib.sha1(token.encode('utf-8')).hexdigest()[:8]}.pdf"
+    )
     cached_pdf = download_dir / cache_name
     download_url_to_file(slides_url, cached_pdf)
 
@@ -205,7 +226,9 @@ def build_shared_alt_note(share_url: str, download_dir: Path, output_folder: Pat
     }
 
 
-def build_pdf_note(pdf_input: str, download_dir: Path, output_folder: Path | None = None) -> dict:
+def build_pdf_note(
+    pdf_input: str, download_dir: Path, output_folder: Path | None = None
+) -> dict:
     today = dt.date.today().isoformat()
 
     if is_url(pdf_input):
@@ -240,6 +263,7 @@ def build_pdf_note(pdf_input: str, download_dir: Path, output_folder: Path | Non
 
 # ── Alt DB reading ─────────────────────────────────────────────────────────────
 
+
 def resolve_folder_path(folder_id, folders: dict) -> Path:
     if folder_id is None or folder_id not in folders:
         return Path("기타")
@@ -255,7 +279,9 @@ def resolve_folder_path(folder_id, folders: dict) -> Path:
 def read_alt_notes(db_path: Path | None = None) -> list[dict]:
     path = db_path or ALT_DB
     if not path.exists():
-        raise FileNotFoundError(f"Alt DB를 찾을 수 없습니다: {path}\nAlt(altalt.io)가 설치되어 있는지 확인하세요.\n다른 경로라면 --alt-db 옵션 또는 ALT_DB_PATH 환경변수를 사용하세요.")
+        raise FileNotFoundError(
+            f"Alt DB를 찾을 수 없습니다: {path}\nAlt(altalt.io)가 설치되어 있는지 확인하세요.\n다른 경로라면 --alt-db 옵션 또는 ALT_DB_PATH 환경변수를 사용하세요."
+        )
 
     try:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
@@ -295,19 +321,22 @@ def read_alt_notes(db_path: Path | None = None) -> list[dict]:
                 continue
 
             folder_path = resolve_folder_path(note_row["folder_id"], folders)
-            notes.append({
-                "id": note_id,
-                "title": note_row["title"],
-                "date": note_row["lecture_date"],
-                "folder_path": folder_path,
-                "slide_path": Path(slides_path),
-                "transcript": transcript_text,
-            })
+            notes.append(
+                {
+                    "id": note_id,
+                    "title": note_row["title"],
+                    "date": note_row["lecture_date"],
+                    "folder_path": folder_path,
+                    "slide_path": Path(slides_path),
+                    "transcript": transcript_text,
+                }
+            )
 
     return notes
 
 
 # ── Transcript parsing & alignment ────────────────────────────────────────────
+
 
 def parse_transcript_segments(content_text) -> list[dict]:
     if not isinstance(content_text, str):
@@ -322,7 +351,9 @@ def parse_transcript_segments(content_text) -> list[dict]:
             try:
                 text = seg.get("text", "").strip()
                 if text:
-                    segments.append({"start": seg["start"], "end": seg["end"], "text": text})
+                    segments.append(
+                        {"start": seg["start"], "end": seg["end"], "text": text}
+                    )
             except (KeyError, TypeError):
                 continue
     return segments
@@ -334,6 +365,7 @@ def get_full_transcript(segments: list[dict]) -> str:
 
 # ── Prompt building ────────────────────────────────────────────────────────────
 
+
 def get_course_context(folder_path: Path) -> str:
     for part in folder_path.parts:
         if part.upper() in COURSE_CONTEXTS:
@@ -341,7 +373,9 @@ def get_course_context(folder_path: Path) -> str:
     return "이 슬라이드는 대학교 전공 강의 자료입니다."
 
 
-def build_prompt(course_context: str, full_transcript: str, note_summary: str = "") -> str:
+def build_prompt(
+    course_context: str, full_transcript: str, note_summary: str = ""
+) -> str:
     has_summary = bool(note_summary.strip())
     has_transcript = bool(full_transcript.strip())
 
@@ -354,7 +388,8 @@ def build_prompt(course_context: str, full_transcript: str, note_summary: str = 
     extra_context = f"\n{'\n\n'.join(context_sections)}\n" if context_sections else ""
     lecture_note_item = (
         "- **강의 맥락**: 전체 음성 전사에서 **현재 슬라이드의 내용과 일치하는 구간**을 찾아, 교수님의 실제 설명과 강조 포인트를 반영하세요. 슬라이드와 무관한 음성 전사 내용은 절대 포함하지 마세요.\n"
-        if context_sections else ""
+        if context_sections
+        else ""
     )
     slide_ref = "와 제공된 강의 맥락" if context_sections else ""
 
@@ -395,9 +430,11 @@ def _parse_md_sections(md_text: str) -> tuple[str, dict[int, str]]:
     if not first_slide:
         return normalized.rstrip() + "\n", {}
 
-    header = normalized[:first_slide.start()].rstrip() + "\n\n"
+    header = normalized[: first_slide.start()].rstrip() + "\n\n"
     sections: dict[int, str] = {}
-    for match in re.finditer(r"(?ms)^## Slide (\d+)\n.*?(?=^## Slide \d+\n|\Z)", normalized):
+    for match in re.finditer(
+        r"(?ms)^## Slide (\d+)\n.*?(?=^## Slide \d+\n|\Z)", normalized
+    ):
         sections[int(match.group(1))] = match.group(0).rstrip() + "\n\n"
     return header, sections
 
@@ -407,7 +444,8 @@ def find_failed_slides(output_md: Path) -> set[int]:
         return set()
     _, sections = _parse_md_sections(output_md.read_text(encoding="utf-8"))
     return {
-        num for num, text in sections.items()
+        num
+        for num, text in sections.items()
         if "*오류 발생으로 해설을 생성하지 못했습니다.*" in text
         or "*빈 슬라이드이거나 응답을 생성할 수 없었습니다.*" in text
     }
@@ -435,7 +473,9 @@ def _process_slide(
             warning_logs.append(warning)
 
         img = Image.open(io.BytesIO(pix.tobytes("png")))
-        response = get_client().models.generate_content(model=MODEL_ID, contents=[prompt, img])
+        response = get_client().models.generate_content(
+            model=MODEL_ID, contents=[prompt, img]
+        )
 
         if response.text:
             content = response.text
@@ -443,7 +483,9 @@ def _process_slide(
             finish_reason = "unknown"
             if response.candidates:
                 finish_reason = str(response.candidates[0].finish_reason)
-            print(f"  [경고] 슬라이드 {page_num}: 빈 응답 (finish_reason={finish_reason})")
+            print(
+                f"  [경고] 슬라이드 {page_num}: 빈 응답 (finish_reason={finish_reason})"
+            )
             content = "*빈 슬라이드이거나 응답을 생성할 수 없었습니다.*"
 
     except Exception as e:
@@ -491,7 +533,9 @@ def explain_pdf(
 
         if target_slides:
             if not output_md.exists():
-                print(f"{tag} [오류] '{output_md}'이 없습니다. 먼저 전체 처리를 실행하세요.")
+                print(
+                    f"{tag} [오류] '{output_md}'이 없습니다. 먼저 전체 처리를 실행하세요."
+                )
                 return
 
             print(f"{tag} 슬라이드 {sorted(target_slides)} 재처리 중...")
@@ -499,22 +543,32 @@ def explain_pdf(
 
             for num in sorted(target_slides):
                 if num < 1 or num > num_pages:
-                    print(f"{tag} [경고] 슬라이드 {num}은 범위를 벗어납니다 (총 {num_pages}장). 건너뜁니다.")
+                    print(
+                        f"{tag} [경고] 슬라이드 {num}은 범위를 벗어납니다 (총 {num_pages}장). 건너뜁니다."
+                    )
                     continue
 
                 print(f"{tag} -> 슬라이드 {num}/{num_pages} 재처리 중...")
                 prompt = build_prompt(course_context, full_transcript, note_summary)
-                sections[num] = _process_slide(doc.load_page(num - 1), prompt, num, delay, warning_logs)
+                sections[num] = _process_slide(
+                    doc.load_page(num - 1), prompt, num, delay, warning_logs
+                )
 
             full_notes = header + "".join(sections[n] for n in sorted(sections))
         else:
             course_code = next(
-                (p.upper() for p in note["folder_path"].parts if p.upper() in COURSE_CONTEXTS),
+                (
+                    p.upper()
+                    for p in note["folder_path"].parts
+                    if p.upper() in COURSE_CONTEXTS
+                ),
                 note["folder_path"].parts[0] if note["folder_path"].parts else "강의",
             )
             transcript_label = " (음성 전사 포함)" if has_transcript else ""
-            full_notes = f"# {course_code} - {note_name} 상세 해설 노트{transcript_label}\n\n"
-            full_notes += f"> 이 노트는 Gemini 2.5 Flash를 이용해 자동 생성되었습니다."
+            full_notes = (
+                f"# {course_code} - {note_name} 상세 해설 노트{transcript_label}\n\n"
+            )
+            full_notes += "> 이 노트는 Gemini 3 Flash를 이용해 자동 생성되었습니다."
             if has_transcript:
                 full_notes += " Alt(altalt.io) 음성 전사 데이터를 함께 활용했습니다."
             elif has_summary:
@@ -524,7 +578,9 @@ def explain_pdf(
             for page_num in range(num_pages):
                 print(f"{tag} -> 슬라이드 {page_num + 1}/{num_pages} 처리 중...")
                 prompt = build_prompt(course_context, full_transcript, note_summary)
-                full_notes += _process_slide(doc.load_page(page_num), prompt, page_num + 1, delay, warning_logs)
+                full_notes += _process_slide(
+                    doc.load_page(page_num), prompt, page_num + 1, delay, warning_logs
+                )
 
     full_notes = normalize_generated_markdown(full_notes).rstrip() + "\n"
     output_md.parent.mkdir(parents=True, exist_ok=True)
@@ -538,6 +594,7 @@ def explain_pdf(
 
 
 # ── Output path resolution ─────────────────────────────────────────────────────
+
 
 def get_output_paths(note: dict, output_root: Path = ROOT) -> tuple[Path, Path]:
     """(output_pdf_path, output_md_path) 반환."""
@@ -560,20 +617,25 @@ def ensure_pdf_copied(note: dict, output_pdf: Path):
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
+
 def configure_pymupdf(show_messages: bool = False):
     fitz.TOOLS.mupdf_display_errors(show_messages)
     fitz.TOOLS.mupdf_display_warnings(show_messages)
 
 
 def cmd_list(notes: list[dict]):
-    print(f"\n{'ID':>3}  {'날짜':<12}  {'폴더':<20}  {'제목':<40}  {'전사':>4}  {'노트':>4}")
+    print(
+        f"\n{'ID':>3}  {'날짜':<12}  {'폴더':<20}  {'제목':<40}  {'전사':>4}  {'노트':>4}"
+    )
     print("-" * 100)
     for note in notes:
         _, output_md = get_output_paths(note)
         has_transcript = "✓" if note["transcript"] else "-"
         has_notes = "✓" if output_md.exists() else "-"
         folder_str = str(note["folder_path"])
-        print(f"{note['id']:>3}  {note['date']:<12}  {folder_str:<20}  {note['title'][:40]:<40}  {has_transcript:>4}  {has_notes:>4}")
+        print(
+            f"{note['id']:>3}  {note['date']:<12}  {folder_str:<20}  {note['title'][:40]:<40}  {has_transcript:>4}  {has_notes:>4}"
+        )
     print(f"\n총 {len(notes)}개 노트  (전사: 음성 전사 있음, 노트: 이미 생성됨)")
 
 
@@ -594,26 +656,74 @@ def main():
   python script.py --all -j 2                    # 병렬 처리
         """,
     )
-    parser.add_argument("--list", action="store_true", help="처리 가능한 Alt 노트 목록 출력")
+    parser.add_argument(
+        "--list", action="store_true", help="처리 가능한 Alt 노트 목록 출력"
+    )
     parser.add_argument("--note", help="처리할 노트 ID (쉼표 구분, 예: 1,2,3)")
-    parser.add_argument("--all", action="store_true", help="슬라이드가 있는 모든 노트 처리")
-    parser.add_argument("--share-link", action="append", metavar="URL", help="Alt 공유 링크 직접 처리 (반복 사용 가능)")
-    parser.add_argument("--pdf", action="append", metavar="PATH_OR_URL", help="일반 PDF 파일 또는 URL 직접 처리 (반복 사용 가능)")
-    parser.add_argument("--output-folder", metavar="PATH", help="share-link/pdf 입력의 출력 폴더 (예: CSED232/기말)")
-    parser.add_argument("--delay", type=float, default=2.0, help="슬라이드 처리 간 대기 시간(초), 기본값: 2.0")
-    parser.add_argument("--retry", action="store_true", help="오류가 발생한 슬라이드만 재처리")
-    parser.add_argument("--slides", help="재처리할 슬라이드 번호 (쉼표 구분, 예: 3,7,12)")
-    parser.add_argument("--workers", "-j", type=int, default=1, metavar="N", help="병렬 처리 워커 수 (기본값: 1)")
-    parser.add_argument("--show-mupdf-messages", action="store_true", help="MuPDF 내부 경고를 콘솔에 표시")
-    parser.add_argument("--save-warning-log", action="store_true", help="MuPDF 경고를 .mupdf_warnings.log 파일로 저장")
-    parser.add_argument("--alt-db", metavar="PATH", help="Alt DB 경로 직접 지정 (기본값: ~/Library/Application Support/alt/data/database/lecture_notes.db)")
+    parser.add_argument(
+        "--all", action="store_true", help="슬라이드가 있는 모든 노트 처리"
+    )
+    parser.add_argument(
+        "--share-link",
+        action="append",
+        metavar="URL",
+        help="Alt 공유 링크 직접 처리 (반복 사용 가능)",
+    )
+    parser.add_argument(
+        "--pdf",
+        action="append",
+        metavar="PATH_OR_URL",
+        help="일반 PDF 파일 또는 URL 직접 처리 (반복 사용 가능)",
+    )
+    parser.add_argument(
+        "--output-folder",
+        metavar="PATH",
+        help="share-link/pdf 입력의 출력 폴더 (예: CSED232/기말)",
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=2.0,
+        help="슬라이드 처리 간 대기 시간(초), 기본값: 2.0",
+    )
+    parser.add_argument(
+        "--retry", action="store_true", help="오류가 발생한 슬라이드만 재처리"
+    )
+    parser.add_argument(
+        "--slides", help="재처리할 슬라이드 번호 (쉼표 구분, 예: 3,7,12)"
+    )
+    parser.add_argument(
+        "--workers",
+        "-j",
+        type=int,
+        default=1,
+        metavar="N",
+        help="병렬 처리 워커 수 (기본값: 1)",
+    )
+    parser.add_argument(
+        "--show-mupdf-messages",
+        action="store_true",
+        help="MuPDF 내부 경고를 콘솔에 표시",
+    )
+    parser.add_argument(
+        "--save-warning-log",
+        action="store_true",
+        help="MuPDF 경고를 .mupdf_warnings.log 파일로 저장",
+    )
+    parser.add_argument(
+        "--alt-db",
+        metavar="PATH",
+        help="Alt DB 경로 직접 지정 (기본값: ~/Library/Application Support/alt/data/database/lecture_notes.db)",
+    )
 
     args = parser.parse_args()
     configure_pymupdf(show_messages=args.show_mupdf_messages)
 
     import_mode = bool(args.share_link or args.pdf)
     if import_mode and (args.list or args.note or args.all or args.alt_db):
-        parser.error("--share-link/--pdf는 --list, --note, --all, --alt-db와 함께 사용할 수 없습니다.")
+        parser.error(
+            "--share-link/--pdf는 --list, --note, --all, --alt-db와 함께 사용할 수 없습니다."
+        )
 
     selected: list[dict]
     output_folder = Path(args.output_folder) if args.output_folder else None
@@ -624,9 +734,13 @@ def main():
         if import_mode:
             selected = []
             for share_url in args.share_link or []:
-                selected.append(build_shared_alt_note(share_url, temp_dir / "shared", output_folder))
+                selected.append(
+                    build_shared_alt_note(share_url, temp_dir / "shared", output_folder)
+                )
             for pdf_input in args.pdf or []:
-                selected.append(build_pdf_note(pdf_input, temp_dir / "pdfs", output_folder))
+                selected.append(
+                    build_pdf_note(pdf_input, temp_dir / "pdfs", output_folder)
+                )
         else:
             db_path = Path(args.alt_db) if args.alt_db else None
             notes = read_alt_notes(db_path)
@@ -642,7 +756,9 @@ def main():
                 try:
                     ids = [int(x.strip()) for x in args.note.split(",")]
                 except ValueError:
-                    print("[오류] --note 인자는 쉼표로 구분된 숫자여야 합니다. 예: 1,2,3")
+                    print(
+                        "[오류] --note 인자는 쉼표로 구분된 숫자여야 합니다. 예: 1,2,3"
+                    )
                     sys.exit(1)
                 selected = []
                 for nid in ids:
@@ -660,11 +776,16 @@ def main():
             try:
                 manual_slides = {int(s.strip()) for s in args.slides.split(",")}
             except ValueError:
-                print("[오류] --slides 인자는 쉼표로 구분된 숫자여야 합니다. 예: 3,7,12")
+                print(
+                    "[오류] --slides 인자는 쉼표로 구분된 숫자여야 합니다. 예: 3,7,12"
+                )
                 sys.exit(1)
 
         workers = min(args.workers, len(selected))
-        print(f"총 {len(selected)}개 노트를 처리합니다." + (f" (워커 {workers}개 병렬)" if workers > 1 else ""))
+        print(
+            f"총 {len(selected)}개 노트를 처리합니다."
+            + (f" (워커 {workers}개 병렬)" if workers > 1 else "")
+        )
 
         def process_one(idx_note):
             idx, note = idx_note
@@ -699,7 +820,10 @@ def main():
                 process_one(item)
         else:
             with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = {executor.submit(process_one, item): item for item in enumerate(selected, 1)}
+                futures = {
+                    executor.submit(process_one, item): item
+                    for item in enumerate(selected, 1)
+                }
                 for future in as_completed(futures):
                     exc = future.exception()
                     if exc:
