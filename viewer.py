@@ -1,7 +1,8 @@
 """
 altToNotes 뷰어 — PDF와 노트를 나란히 보여주는 로컬 웹 서버
-사용법: python viewer.py [루트_디렉토리]  (기본값: 현재 디렉토리)
+사용법: python viewer.py [루트_디렉토리]  (기본값: viewer.py가 있는 디렉토리)
 """
+import argparse
 import json
 import mimetypes
 import re
@@ -12,14 +13,11 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
+from notes_index import build_file_groups, natural_key as _natural_key
 
-def _natural_key(path: Path):
-    """Sort key for natural (human) ordering: '10_foo' comes after '2_bar'."""
-    return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', str(path))]
 
-ROOT = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path.cwd()
 SCRIPT_DIR = Path(__file__).parent.resolve()  # repo root — for serving static PWA assets
-PORT = 7788
+ROOT = SCRIPT_DIR
 
 HTML = r"""<!DOCTYPE html>
 <html lang="ko">
@@ -177,6 +175,7 @@ HTML = r"""<!DOCTYPE html>
     border-left-color: var(--accent);
     color: #fff;
   }
+  .file-item.no-pdf { color: #d7c17d; }
   .file-item.no-notes { color: #666; }
   .file-item.no-notes::after {
     content: ' (노트 없음)';
@@ -830,6 +829,28 @@ HTML = r"""<!DOCTYPE html>
     background-clip: padding-box;
   }
   ::-webkit-scrollbar-track { background: transparent; }
+
+  /* Markdown editor */
+  #notes-editor {
+    flex: 1;
+    display: none;
+    width: 100%;
+    padding: 20px 28px;
+    background: #12141a;
+    color: var(--text);
+    font-family: 'SFMono-Regular', Menlo, Consolas, monospace;
+    font-size: 13px;
+    line-height: 1.7;
+    border: none;
+    resize: none;
+    outline: none;
+    overflow-y: auto;
+    tab-size: 2;
+    min-height: 0;
+  }
+  #notes-editor.active { display: block; }
+  #notes-edit-btn.editing { color: var(--accent-2) !important; border-color: var(--accent-2) !important; }
+  .editor-dirty #notes-toolbar-filename::after { content: ' ●'; color: var(--accent-2); }
 </style>
 </head>
 <body>
@@ -862,6 +883,9 @@ let notesZoom = parseFloat(localStorage.getItem('autonotes_zoom')) || 15; // px
 let pdfSyncEnabled = localStorage.getItem('autonotes_sync') !== '0'; // default: true
 let pdfSyncSuppressUntil = 0;
 let currentHeadings = [];
+let editMode = false;
+let editorDirty = false;
+let editorCurrentPath = null;
 
 const md = window.markdownit({
   html: true,
@@ -1115,6 +1139,68 @@ hr{border:none;border-top:1px solid #ddd;margin:1.2em 0}
   win.onload = () => { win.print(); };
 }
 
+function updateEditorTitle() {
+  const filenameEl = document.getElementById('notes-toolbar-filename');
+  if (!filenameEl || !currentFile) return;
+  filenameEl.textContent = currentFile.stem + '.md';
+  const notesPaneEl = document.getElementById('notes-pane');
+  if (notesPaneEl) notesPaneEl.classList.toggle('editor-dirty', editorDirty);
+}
+
+async function saveNote() {
+  const editorEl = document.getElementById('notes-editor');
+  if (!editorEl || !editorCurrentPath || !editMode) return;
+  try {
+    const res = await fetch('/api/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: editorCurrentPath, content: editorEl.value })
+    });
+    if (res.ok) {
+      editorDirty = false;
+      updateEditorTitle();
+      const filenameEl = document.getElementById('notes-toolbar-filename');
+      if (filenameEl) {
+        filenameEl.textContent = '저장됨 ✓';
+        setTimeout(() => updateEditorTitle(), 1200);
+      }
+    }
+  } catch (err) {
+    console.error('Save failed:', err);
+  }
+}
+
+async function toggleEditMode() {
+  if (!currentFile) return;
+  editMode = !editMode;
+  const scrollEl = document.getElementById('notes-scroll');
+  const editorEl = document.getElementById('notes-editor');
+  const editBtn = document.getElementById('notes-edit-btn');
+  if (!scrollEl || !editorEl || !editBtn) return;
+
+  if (editMode) {
+    const res = await fetch('/file?path=' + encodeURIComponent(currentFile.md) + '&raw=1');
+    editorEl.value = await res.text();
+    editorCurrentPath = currentFile.md;
+    editorDirty = false;
+    scrollEl.style.display = 'none';
+    editorEl.classList.add('active');
+    editBtn.classList.add('editing');
+    editBtn.title = '미리보기 (E)';
+    editorEl.focus();
+    updateEditorTitle();
+  } else {
+    editorDirty = false;
+    scrollEl.style.display = '';
+    editorEl.classList.remove('active');
+    editBtn.classList.remove('editing');
+    editBtn.title = '편집 모드 (E)';
+    updateEditorTitle();
+    const notesPaneEl = document.getElementById('notes-pane');
+    if (notesPaneEl) await renderNotesInto(currentFile, notesPaneEl);
+  }
+}
+
 function toggleSync() {
   pdfSyncEnabled = !pdfSyncEnabled;
   localStorage.setItem('autonotes_sync', pdfSyncEnabled ? '1' : '0');
@@ -1357,9 +1443,11 @@ async function loadFiles() {
 
     for (const f of group.files) {
       const item = document.createElement('div');
-      item.className = 'file-item' + (f.has_notes ? '' : ' no-notes');
-      item.textContent = f.stem;
-      item.title = f.pdf;
+      item.className = 'file-item'
+        + (f.has_notes ? '' : ' no-notes')
+        + (f.has_pdf ? '' : ' no-pdf');
+      item.textContent = f.stem + (f.has_pdf ? '' : ' [PDF 없음]');
+      item.title = f.pdf || f.md;
       if (!f.has_notes) noNotesCount++;
       if (!f.has_notes && hideNoNotes) item.style.display = 'none';
       item.addEventListener('click', () => openFile(f, item));
@@ -1462,11 +1550,13 @@ async function openFile(f, item) {
           <button class="refresh-btn" id="notes-zoom-in" title="노트 확대">+</button>
           <button class="refresh-btn sync-btn${pdfSyncEnabled ? ' active' : ''}" title="${pdfSyncEnabled ? 'PDF↔노트 동기화 켜짐' : 'PDF↔노트 동기화 꺼짐'}">⇄</button>
           <button class="refresh-btn theme-btn" title="라이트/다크 + PDF 다크모드 전환">${notesLight ? '☾' : '☀'}</button>
+          <button class="refresh-btn notes-edit-btn" id="notes-edit-btn" title="편집 모드 (E)">✏</button>
           <button class="refresh-btn notes-print-btn" title="인쇄/저장 (P)">⎙</button>
         </div>
       </div>
       <div id="notes-progress"></div>
       <div id="notes-scroll"></div>
+      <textarea id="notes-editor" spellcheck="false"></textarea>
       <div id="toc-sidebar">
         <div class="toc-hd">목차</div>
         <div id="toc-list-container"></div>
@@ -1488,6 +1578,21 @@ async function openFile(f, item) {
     notesPaneEl.querySelector('.sync-btn').addEventListener('click', toggleSync);
     notesPaneEl.querySelector('.theme-btn').addEventListener('click', toggleTheme);
     notesPaneEl.querySelector('.notes-print-btn').addEventListener('click', printNotes);
+    notesPaneEl.querySelector('#notes-edit-btn').addEventListener('click', toggleEditMode);
+
+    const editorEl = notesPaneEl.querySelector('#notes-editor');
+    editorEl.addEventListener('input', () => {
+      if (!editorDirty) { editorDirty = true; updateEditorTitle(); }
+    });
+    editorEl.addEventListener('keydown', e => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); saveNote(); }
+      if (e.key === 'Tab') {
+        e.preventDefault();
+        const s = editorEl.selectionStart, end = editorEl.selectionEnd;
+        editorEl.value = editorEl.value.slice(0, s) + '  ' + editorEl.value.slice(end);
+        editorEl.selectionStart = editorEl.selectionEnd = s + 2;
+      }
+    });
     notesPaneEl.querySelector('#notes-view-pdf').addEventListener('click', () => {
       const d = document.getElementById('divider');
       if (d && d._setViewMode) d._setViewMode(d._viewMode === 'pdf-only' ? 'split' : 'pdf-only');
@@ -1524,7 +1629,46 @@ async function openFile(f, item) {
     });
   }
 
-  iframe.src = '/pdfview?path=' + encodeURIComponent(f.pdf);
+  if (f.has_pdf) {
+    iframe.removeAttribute('srcdoc');
+    iframe.src = '/pdfview?path=' + encodeURIComponent(f.pdf);
+  } else {
+    iframe.srcdoc = `
+      <!DOCTYPE html>
+      <html lang="ko">
+      <head>
+        <meta charset="UTF-8">
+        <style>
+          html, body {
+            height: 100%;
+            margin: 0;
+            background: #17191d;
+            color: #9da1a6;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+          }
+          body {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            padding: 24px;
+          }
+          .box {
+            max-width: 340px;
+            line-height: 1.6;
+          }
+          strong { color: #d4d4d4; }
+        </style>
+      </head>
+      <body>
+        <div class="box">
+          <strong>로컬 PDF가 없습니다.</strong><br>
+          이 항목은 마크다운 노트만 있어 메모는 볼 수 있지만 PDF는 표시할 수 없습니다.
+        </div>
+      </body>
+      </html>
+    `;
+  }
 
   if (f.has_notes) {
     await renderNotesInto(f, notesPaneEl);
@@ -1665,6 +1809,8 @@ document.addEventListener('keydown', e => {
     if (toc) toc.classList.toggle('visible');
   }
   else if (e.key === 'p' && !mod) { e.preventDefault(); printNotes(); }
+  else if (e.key === 'e' && !mod && !e.shiftKey && currentFile) { e.preventDefault(); toggleEditMode(); }
+  else if (e.key === 's' && mod && editMode) { e.preventDefault(); saveNote(); }
   else if ((e.key === '\\') && mod) { e.preventDefault(); toggleSidebar(); }
 });
 
@@ -1922,7 +2068,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._respond(404, "text/plain; charset=utf-8", b"Not found")
 
         elif path == "/api/files":
-            data = self._list_files()
+            data = build_file_groups(ROOT)
             self._respond(200, "application/json; charset=utf-8", json.dumps(data, ensure_ascii=False).encode("utf-8"))
 
         elif path == "/file":
@@ -1943,6 +2089,29 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._respond(404, "text/plain; charset=utf-8", b"Not found")
 
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        if parsed.path != "/api/save":
+            self._respond(404, "text/plain; charset=utf-8", b"Not found")
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            rel = str(body.get("path", ""))
+            content = str(body.get("content", ""))
+            file_path = (ROOT / rel).resolve()
+            if not file_path.is_relative_to(ROOT):
+                self._respond(403, "application/json; charset=utf-8", b'{"error":"Forbidden"}')
+                return
+            if file_path.suffix != ".md":
+                self._respond(400, "application/json; charset=utf-8", b'{"error":"Only .md files"}')
+                return
+            file_path.write_text(content, encoding="utf-8")
+            self._respond(200, "application/json; charset=utf-8", b'{"ok":true}')
+        except Exception as exc:
+            err = json.dumps({"error": str(exc)}).encode("utf-8")
+            self._respond(500, "application/json; charset=utf-8", err)
+
     def _respond(self, code, mime, body):
         self.send_response(code)
         self.send_header("Content-Type", mime)
@@ -1951,31 +2120,29 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _list_files(self):
-        groups: dict[str, list] = {}
-        for pdf in sorted(ROOT.glob("**/*.pdf"), key=_natural_key):
-            rel_pdf = str(pdf.relative_to(ROOT))
-            rel_md = str(pdf.with_suffix(".md").relative_to(ROOT))
-            has_notes = pdf.with_suffix(".md").exists()
-            parts = pdf.relative_to(ROOT).parts
-            course = parts[0] if len(parts) > 1 else "."
-            groups.setdefault(course, []).append({
-                "stem": pdf.stem,
-                "pdf": rel_pdf,
-                "md": rel_md,
-                "has_notes": has_notes,
-            })
-        return [{"course": k, "files": v} for k, v in groups.items()]
+        return build_file_groups(ROOT)
 
 
 def main():
-    server = HTTPServer(("localhost", 0), Handler)
+    global ROOT
+
+    parser = argparse.ArgumentParser(description="altToNotes 로컬 뷰어")
+    parser.add_argument("root", nargs="?", default=str(SCRIPT_DIR), help="스캔할 루트 디렉토리 (기본값: viewer.py가 있는 디렉토리)")
+    parser.add_argument("--port", type=int, default=0, help="바인딩할 포트 (기본값: 0, 자동 선택)")
+    parser.add_argument("--no-browser", action="store_true", help="브라우저를 자동으로 열지 않음")
+    args = parser.parse_args()
+
+    ROOT = Path(args.root).resolve()
+
+    server = HTTPServer(("localhost", args.port), Handler)
     server.allow_reuse_address = True
     port = server.server_address[1]
     url = f"http://localhost:{port}"
     print(f"altToNotes 뷰어 시작: {url}")
     print(f"루트 디렉토리: {ROOT}")
     print("종료하려면 Ctrl+C")
-    threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+    if not args.no_browser:
+        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

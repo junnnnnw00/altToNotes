@@ -385,7 +385,8 @@ def build_prompt(
     if has_transcript:
         context_sections.append(f"[전체 강의 음성 전사]\n{full_transcript}")
 
-    extra_context = f"\n{'\n\n'.join(context_sections)}\n" if context_sections else ""
+    joined_context = "\n\n".join(context_sections)
+    extra_context = f"\n{joined_context}\n" if joined_context else ""
     lecture_note_item = (
         "- **강의 맥락**: 전체 음성 전사에서 **현재 슬라이드의 내용과 일치하는 구간**을 찾아, 교수님의 실제 설명과 강조 포인트를 반영하세요. 슬라이드와 무관한 음성 전사 내용은 절대 포함하지 마세요.\n"
         if context_sections
@@ -639,6 +640,47 @@ def cmd_list(notes: list[dict]):
     print(f"\n총 {len(notes)}개 노트  (전사: 음성 전사 있음, 노트: 이미 생성됨)")
 
 
+def cmd_audit_local(notes: list[dict]):
+    print(f"\n{'ID':>3}  {'폴더':<20}  {'제목':<32}  {'PDF':>4}  {'MD':>4}  출력 경로")
+    print("-" * 112)
+
+    missing_rows = 0
+    for note in notes:
+        output_pdf, output_md = get_output_paths(note)
+        pdf_exists = output_pdf.exists()
+        md_exists = output_md.exists()
+        folder_str = str(note["folder_path"])
+        status_pdf = "✓" if pdf_exists else "-"
+        status_md = "✓" if md_exists else "-"
+        rel_pdf = output_pdf.relative_to(ROOT)
+        print(
+            f"{note['id']:>3}  {folder_str:<20}  {note['title'][:32]:<32}  {status_pdf:>4}  {status_md:>4}  {rel_pdf}"
+        )
+        if not (pdf_exists and md_exists):
+            missing_rows += 1
+
+    if missing_rows == 0:
+        print(f"\n누락된 로컬 export가 없습니다. 총 {len(notes)}개 노트가 모두 정합합니다.")
+    else:
+        print(
+            f"\n총 {len(notes)}개 중 {missing_rows}개 노트에서 PDF 또는 MD 로컬 파일이 누락되었습니다."
+        )
+
+
+def cmd_sync_pdfs(notes: list[dict]):
+    copied = 0
+    skipped = 0
+    for note in notes:
+        output_pdf, _ = get_output_paths(note)
+        if output_pdf.exists():
+            skipped += 1
+            continue
+        ensure_pdf_copied(note, output_pdf)
+        copied += 1
+
+    print(f"\nPDF 동기화 완료: 새로 복사 {copied}개, 이미 존재 {skipped}개")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Alt(altalt.io) 음성 노트 + 강의 슬라이드를 Gemini AI로 페이지별 해설 노트 생성",
@@ -658,6 +700,16 @@ def main():
     )
     parser.add_argument(
         "--list", action="store_true", help="처리 가능한 Alt 노트 목록 출력"
+    )
+    parser.add_argument(
+        "--audit-local",
+        action="store_true",
+        help="Alt DB 기준으로 로컬 export(pdf/md) 누락 여부 점검",
+    )
+    parser.add_argument(
+        "--sync-pdfs",
+        action="store_true",
+        help="Alt DB의 슬라이드 PDF만 로컬 워크스페이스로 동기화",
     )
     parser.add_argument("--note", help="처리할 노트 ID (쉼표 구분, 예: 1,2,3)")
     parser.add_argument(
@@ -720,9 +772,16 @@ def main():
     configure_pymupdf(show_messages=args.show_mupdf_messages)
 
     import_mode = bool(args.share_link or args.pdf)
-    if import_mode and (args.list or args.note or args.all or args.alt_db):
+    if import_mode and (
+        args.list
+        or args.audit_local
+        or args.sync_pdfs
+        or args.note
+        or args.all
+        or args.alt_db
+    ):
         parser.error(
-            "--share-link/--pdf는 --list, --note, --all, --alt-db와 함께 사용할 수 없습니다."
+            "--share-link/--pdf는 --list, --audit-local, --sync-pdfs, --note, --all, --alt-db와 함께 사용할 수 없습니다."
         )
 
     selected: list[dict]
@@ -744,6 +803,14 @@ def main():
         else:
             db_path = Path(args.alt_db) if args.alt_db else None
             notes = read_alt_notes(db_path)
+
+            if args.audit_local:
+                cmd_audit_local(notes)
+                return
+
+            if args.sync_pdfs:
+                cmd_sync_pdfs(notes)
+                return
 
             if args.list or (not args.note and not args.all):
                 cmd_list(notes)

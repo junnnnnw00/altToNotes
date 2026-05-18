@@ -15,7 +15,7 @@
 | 🎙️ 음성 전사 활용 | Alt 로컬 DB 또는 공유 링크의 전사가 있으면 슬라이드와 시간 비례로 매핑 |
 | 🔗 공유 링크 입력 | macOS/Alt 설치 없이 `https://altalt.io/note/...` 링크만으로 처리 |
 | 📥 일반 PDF 가져오기 | 전사·요약이 없어도 로컬 PDF 또는 PDF URL에서 바로 생성 |
-| 📄 페이지별 해설 | 슬라이드 이미지 + 제공된 강의 맥락(있다면) → Gemini 2.5 Flash 해설 |
+| 📄 페이지별 해설 | 슬라이드 이미지 + 제공된 강의 맥락(있다면) → Gemini 3 Flash 해설 |
 | 🔄 자동 동기화 | Alt DB에서 직접 읽어 별도 export 불필요 |
 | 🌐 GitHub Pages | `build_static.py` 한 번으로 정적 사이트 배포 |
 | ⌨️ 단축키 | `[`/`]` 슬라이드 이동, `t` 목차, `Ctrl+\` 사이드바 |
@@ -84,6 +84,12 @@ python script.py --note 1 --retry
 
 # 특정 슬라이드만 재처리
 python script.py --note 1 --slides 3,7,12
+
+# Alt DB 기준으로 로컬 PDF/노트 누락 점검
+python script.py --audit-local
+
+# Alt DB의 슬라이드 PDF만 로컬로 동기화
+python script.py --sync-pdfs
 ```
 
 ### 3-2. Alt 공유 링크 모드
@@ -139,6 +145,32 @@ python viewer.py
 ```
 
 브라우저가 자동으로 열리고 PDF와 노트를 나란히 볼 수 있습니다.
+
+기본 스캔 경로는 `viewer.py`가 있는 저장소 루트입니다. 따라서 다른 디렉토리에서 실행해도 잘못된 경로를 읽지 않습니다.
+
+PDF가 빠져도 `.md` 노트가 있으면 목록에서 사라지지 않고, PDF 영역에는 안내 메시지를 표시합니다.
+
+### macOS 앱으로 빌드
+
+```bash
+python build_viewer_app.py
+```
+
+빌드 결과:
+
+```text
+dist/AltToNotes Viewer.app
+```
+
+이 앱은 저장소 안의 현재 `viewer.py`를 직접 실행하므로, 코드가 바뀌면 앱을 다시 패키징하지 않아도 다음 실행부터 반영됩니다. 저장소 위치를 옮긴 경우에만 다시 빌드하면 됩니다.
+
+### 업데이트
+
+```bash
+./update_alttonotes.command
+```
+
+이 스크립트는 작업 트리가 깨끗할 때만 `origin/main`을 fast-forward로 가져오고 앱 런처를 다시 빌드합니다.
 
 ### 단축키
 

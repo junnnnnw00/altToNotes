@@ -4,18 +4,14 @@ Generate static files for GitHub Pages deployment.
 Produces index.html, pdfview.html, files.json at repo root.
 """
 import json
-import re
 import sys
 from pathlib import Path
-
-
-def _natural_key(path: Path):
-    return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', str(path))]
 
 ROOT = Path(__file__).parent
 
 sys.path.insert(0, str(ROOT))
 from viewer import HTML, PDFVIEW_HTML
+from notes_index import build_file_groups
 
 # ── Patch main viewer HTML for static serving ─────────────────────────────────
 index_html = HTML
@@ -46,30 +42,12 @@ pdfview_html = pdfview_html.replace(
 print("✓ pdfview.html")
 
 # ── Generate files.json ───────────────────────────────────────────────────────
-groups: dict[str, list] = {}
-skip_dirs = {"__pycache__", ".git", "node_modules", ".omc"}
-
-for pdf in sorted(ROOT.glob("**/*.pdf"), key=_natural_key):
-    rel = pdf.relative_to(ROOT)
-    if any(p.startswith(".") or p in skip_dirs for p in rel.parts):
-        continue
-    rel_pdf = str(rel).replace("\\", "/")
-    rel_md = str(rel.with_suffix(".md")).replace("\\", "/")
-    has_notes = (ROOT / rel_md).exists()
-    course = rel.parts[0] if len(rel.parts) > 1 else "."
-    groups.setdefault(course, []).append({
-        "stem": pdf.stem,
-        "pdf": rel_pdf,
-        "md": rel_md,
-        "has_notes": has_notes,
-    })
-
-data = [{"course": k, "files": v} for k, v in groups.items()]
+data = build_file_groups(ROOT)
 (ROOT / "files.json").write_text(
     json.dumps(data, ensure_ascii=False, indent=2),
     encoding="utf-8",
 )
-total = sum(len(g["files"]) for g in data)
+total = sum(len(group["files"]) for group in data)
 print(f"✓ files.json  ({len(data)} courses, {total} files)")
 
 # ── PWA static assets ─────────────────────────────────────────────────────────
@@ -94,7 +72,7 @@ try:
         output_height=192,
     )
     print("✓ icon-512.png, icon-192.png  (via cairosvg)")
-except ImportError:
-    print("⚠  cairosvg not installed — skipping icon PNGs")
+except (ImportError, OSError) as exc:
+    print(f"⚠  icon PNG generation skipped: {exc}")
 
 print("\nDone. Commit index.html, pdfview.html, files.json to deploy.")
