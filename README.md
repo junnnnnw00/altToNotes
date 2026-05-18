@@ -162,7 +162,7 @@ python build_viewer_app.py
 dist/AltToNotes Viewer.app
 ```
 
-이 앱은 저장소 안의 현재 `viewer.py`를 직접 실행하므로, 코드가 바뀌면 앱을 다시 패키징하지 않아도 다음 실행부터 반영됩니다. 저장소 위치를 옮긴 경우에만 다시 빌드하면 됩니다.
+이 앱은 빌드 시점의 `viewer.py`와 필요한 정적 자산을 앱 내부에 복사합니다. 저장소 내용을 최신 코드로 반영하려면 `python build_viewer_app.py`를 다시 실행하면 됩니다.
 
 ### 업데이트
 

@@ -14,18 +14,27 @@ APP_NAME = "AltToNotes Viewer"
 APP_PATH = DIST_DIR / f"{APP_NAME}.app"
 CONTENTS_DIR = APP_PATH / "Contents"
 MACOS_DIR = CONTENTS_DIR / "MacOS"
+RESOURCES_APP_DIR = CONTENTS_DIR / "Resources" / "app"
 LAUNCHER_PATH = MACOS_DIR / APP_NAME
 INFO_PLIST_PATH = CONTENTS_DIR / "Info.plist"
 LOG_PATH = "/tmp/alttonotes-viewer.log"
+RUNTIME_FILES = (
+    "viewer.py",
+    "notes_index.py",
+    "manifest.json",
+    "sw.js",
+    "icon.svg",
+    "favicon.svg",
+)
 
 
 def build_launcher_script() -> str:
     repo_root = str(REPO_ROOT)
-    viewer_path = str(REPO_ROOT / "viewer.py")
+    viewer_path = str(RESOURCES_APP_DIR / "viewer.py")
     return f"""#!/bin/zsh
 set -euo pipefail
 cd {shlex.quote(repo_root)}
-/usr/bin/python3 {shlex.quote(viewer_path)} --root {shlex.quote(repo_root)} >{shlex.quote(LOG_PATH)} 2>&1 &
+nohup /usr/bin/python3 -u {shlex.quote(viewer_path)} {shlex.quote(repo_root)} >{shlex.quote(LOG_PATH)} 2>&1 </dev/null &
 """
 
 
@@ -48,9 +57,13 @@ def main():
         shutil.rmtree(APP_PATH)
 
     MACOS_DIR.mkdir(parents=True, exist_ok=True)
+    RESOURCES_APP_DIR.mkdir(parents=True, exist_ok=True)
 
     LAUNCHER_PATH.write_text(build_launcher_script(), encoding="utf-8")
     os.chmod(LAUNCHER_PATH, 0o755)
+
+    for name in RUNTIME_FILES:
+        shutil.copy2(REPO_ROOT / name, RESOURCES_APP_DIR / name)
 
     with INFO_PLIST_PATH.open("wb") as handle:
         plistlib.dump(build_info_plist(), handle)
